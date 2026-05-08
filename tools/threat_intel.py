@@ -1,6 +1,7 @@
 # Phase 2: check_malwarebazaar, check_virustotal, check_ip_reputation, check_domain_reputation
-import os
 import requests
+
+from malsight.config import VIRUSTOTAL_API_KEY, ABUSEIPDB_API_KEY
 
 
 def check_malwarebazaar(hash: str) -> dict:
@@ -28,8 +29,9 @@ def check_malwarebazaar(hash: str) -> dict:
 
 def check_virustotal(hash: str) -> dict:
     """Query VirusTotal for multi-engine detection results on a SHA-256 hash."""
-    api_key = os.environ.get("VIRUSTOTAL_API_KEY")
-    if not api_key:
+    try:
+        api_key = VIRUSTOTAL_API_KEY()
+    except RuntimeError:
         return {"error": "API key not configured"}
     try:
         resp = requests.get(
@@ -70,8 +72,9 @@ def check_virustotal(hash: str) -> dict:
 
 def check_ip_reputation(ip: str) -> dict:
     """Query AbuseIPDB for abuse confidence score and categories for an IP address."""
-    api_key = os.environ.get("ABUSEIPDB_API_KEY")
-    if not api_key:
+    try:
+        api_key = ABUSEIPDB_API_KEY()
+    except RuntimeError:
         return {"error": "API key not configured"}
     try:
         resp = requests.get(
@@ -99,8 +102,9 @@ def check_ip_reputation(ip: str) -> dict:
 
 def check_domain_reputation(domain: str) -> dict:
     """Query AbuseIPDB check endpoint with a domain name for threat verdict."""
-    api_key = os.environ.get("ABUSEIPDB_API_KEY")
-    if not api_key:
+    try:
+        api_key = ABUSEIPDB_API_KEY()
+    except RuntimeError:
         return {"error": "API key not configured"}
     try:
         resp = requests.get(
