@@ -1,0 +1,51 @@
+[tool.poetry]
+name = "malsight"
+version = "0.1.0"
+description = "AI-powered malware analyzer with a Gemini 1.5 Pro agent brain"
+authors = ["Hackathon Team"]
+readme = "README.md"
+packages = [
+    { include = "malsight" },
+    { include = "tools" },
+    { include = "api" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+requests = "^2.32"
+python-magic = "^0.4"
+pefile = "^2024.8"
+"pdfminer.six" = "^20231228"
+pikepdf = "^9.0"
+yara-python = "^4.5"
+docker = "^7.1"
+kubernetes = ">=28.1.0"
+signify = "^0.5"
+google-genai = ">=1.0.0"
+google-cloud-secret-manager = ">=2.16.0"
+fastapi = { version = ">=0.111.0", extras = ["standard"] }
+uvicorn = { version = ">=0.29.0", extras = ["standard"] }
+python-multipart = ">=0.0.9"
+rq = ">=1.16"
+redis = ">=5.0"
+psycopg2-binary = ">=2.9"
+python-dotenv = ">=1.0"
+asyncpg = { version = "^0.29", optional = true }
+
+[tool.poetry.extras]
+asyncpg = ["asyncpg"]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2"
+pytest-mock = "^3.14"
+pytest-asyncio = "^0.23"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
