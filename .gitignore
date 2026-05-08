@@ -18,7 +18,7 @@ htmlcov/
 venv/
 env/
 ENV/
-
+tmp
 # Build and packaging
 build/
 dist/

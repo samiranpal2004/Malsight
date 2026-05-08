@@ -1,15 +1,19 @@
 # Phase 4: FastAPI route handlers — all 5 endpoints from PRD Section 9.1.
 import asyncio
 import hashlib
+import json
 import logging
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import redis as redis_lib
 from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from rq import Queue, Worker
 
 from api import db
@@ -57,6 +61,12 @@ def _elapsed(ts: datetime | None) -> int:
     return max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
 
 
+def sanitize_filename(name: str) -> str:
+    name = name.replace(" ", "_")
+    name = re.sub(r"[^\w\-.]", "", name)
+    return name
+
+
 # ── POST /analyze ─────────────────────────────────────────────────────────────
 
 @router.post("/analyze", status_code=200)
@@ -79,8 +89,8 @@ async def analyze(
         raise HTTPException(status_code=400, detail="File exceeds 50 MB limit")
 
     # Validate extension
-    filename = file.filename or "unknown"
-    ext = os.path.splitext(filename)[1].lower()
+    original_filename = file.filename or "unknown"
+    ext = os.path.splitext(original_filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
@@ -97,15 +107,18 @@ async def analyze(
     sha256 = hashlib.sha256(data).hexdigest()
     job_id = str(uuid.uuid4())
 
-    # Save to staging directory
-    job_dir = os.path.join(STAGING_DIR, job_id)
-    file_path = os.path.join(job_dir, f"original_{filename}")
-    await asyncio.to_thread(_write_file, job_dir, file_path, data)
+    # Build staging path with pathlib to guarantee forward slashes on all platforms.
+    # safe_filename strips spaces and non-safe chars; original_filename is stored in DB.
+    safe_filename = sanitize_filename(original_filename)
+    staging_dir = Path("/tmp/malsight_jobs") / job_id
+    file_path = staging_dir / f"original_{safe_filename}"
+    await asyncio.to_thread(_write_file, staging_dir, file_path, data)
+    file_path_str = str(file_path).replace("\\", "/")
 
-    # Persist job row
+    # Persist job row (store original_filename for display, safe path on disk)
     await asyncio.to_thread(
-        db.insert_job, job_id, "queued", mode, filename, sha256,
-        len(data), file.content_type or "", file_path,
+        db.insert_job, job_id, "queued", mode, original_filename, sha256,
+        len(data), file.content_type or "", file_path_str,
     )
 
     # Enqueue RQ job (import here so worker module is only loaded when needed)
@@ -113,7 +126,7 @@ async def analyze(
 
     try:
         q = _queue()
-        q.enqueue(analyze_file_job, job_id, file_path, mode, filename, job_timeout=600)
+        q.enqueue(analyze_file_job, job_id, file_path_str, mode, original_filename, job_timeout=600)
     except Exception as exc:
         logger.error("Failed to enqueue job %s: %s", job_id, exc)
         raise HTTPException(status_code=500, detail="Queue unavailable — try again shortly")
@@ -126,8 +139,8 @@ async def analyze(
     }
 
 
-def _write_file(job_dir: str, file_path: str, data: bytes) -> None:
-    os.makedirs(job_dir, exist_ok=True)
+def _write_file(job_dir, file_path, data: bytes) -> None:
+    Path(job_dir).mkdir(parents=True, exist_ok=True)
     with open(file_path, "wb") as fh:
         fh.write(data)
 
@@ -301,8 +314,83 @@ async def delete_report(
         raise HTTPException(status_code=404, detail="Job not found")
 
     # Best-effort cleanup of staged files
-    job_dir = os.path.join(STAGING_DIR, job_id)
-    if os.path.exists(job_dir):
+    job_dir = Path("/tmp/malsight_jobs") / job_id
+    if job_dir.exists():
         await asyncio.to_thread(shutil.rmtree, job_dir, True)
 
     return {"deleted": True, "job_id": job_id}
+
+
+# ── GET /stream/{job_id} ──────────────────────────────────────────────────────
+
+@router.get("/stream/{job_id}")
+async def stream_job(
+    job_id: str,
+    request: Request,
+    x_api_key: str | None = Header(None),
+):
+    """SSE endpoint — streams agent thoughts, tool calls, and tool results in real time.
+
+    Reads from Redis (key: malsight:stream:{job_id}) so it works correctly
+    when the RQ worker and uvicorn run in separate processes.
+    """
+    _require_api_key(x_api_key)
+
+    async def event_generator():
+        import redis as redis_lib
+        redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
+        key = f"malsight:stream:{job_id}"
+        last_index = 0
+        consecutive_empty = 0
+        max_empty = int(120 / 0.3)  # give up after ~2 minutes of no events
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            try:
+                r = await asyncio.to_thread(
+                    redis_lib.from_url, redis_url, socket_connect_timeout=2
+                )
+                raw_events = await asyncio.to_thread(r.lrange, key, last_index, -1)
+
+                for raw in raw_events:
+                    event = json.loads(raw)
+                    yield f"data: {json.dumps(event)}\n\n"
+                    last_index += 1
+                    if event.get("type") == "done":
+                        job = await asyncio.to_thread(db.get_job, job_id)
+                        status = job.get("status", "complete") if job else "complete"
+                        yield f"data: {json.dumps({'type': 'done', 'status': status})}\n\n"
+                        return
+
+                if raw_events:
+                    consecutive_empty = 0
+                else:
+                    consecutive_empty += 1
+
+                # Fall back to DB status when no done event arrives (crash / timeout)
+                if consecutive_empty > 10:
+                    job = await asyncio.to_thread(db.get_job, job_id)
+                    if job and job.get("status") in ("complete", "failed"):
+                        yield f"data: {json.dumps({'type': 'done', 'status': job['status']})}\n\n"
+                        return
+
+                if consecutive_empty > max_empty:
+                    yield f"data: {json.dumps({'type': 'done', 'status': 'timeout'})}\n\n"
+                    return
+
+            except Exception:
+                pass  # Redis unavailable — wait and retry
+
+            await asyncio.sleep(0.3)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
