@@ -50,7 +50,13 @@ def analyze_file_job(
 
     try:
         # ── Step 1 ──────────────────────────────────────────────────────────
-        db.update_job_status(job_id, "running", started_at=datetime.now(timezone.utc))
+        job_started_at = datetime.now(timezone.utc)
+        db.update_job_status(
+            job_id, "running",
+            started_at=job_started_at,
+            current_step=0,
+            current_action="Starting analysis...",
+        )
         logger.info("Job %s starting (mode=%s, file=%s)", job_id, mode, filename)
 
         # ── Step 2 ──────────────────────────────────────────────────────────
@@ -80,6 +86,15 @@ def analyze_file_job(
             "entropy": entropy,
         }
 
+        # Zip files must never be extracted on the host — pass the zip as-is to
+        # the agent, which will extract it inside the gVisor sandbox container.
+        if ext == ".zip":
+            file_meta["is_zip"] = True
+            file_meta["zip_password"] = "infected"  # MalwareBazaar standard password
+        else:
+            file_meta["is_zip"] = False
+            file_meta["zip_password"] = None
+
         # ── Step 3 ──────────────────────────────────────────────────────────
         logger.info("Job %s: starting agent loop (mode=%s)", job_id, mode)
         report = _malsight_agent.run_agent(file_path, file_meta, mode)
@@ -88,8 +103,11 @@ def analyze_file_job(
         db.insert_report(job_id, report)
 
         # ── Step 5 ──────────────────────────────────────────────────────────
+        completed_at = datetime.now(timezone.utc)
+        elapsed = int((completed_at - job_started_at).total_seconds())
         db.update_job_status(
-            job_id, "complete", completed_at=datetime.now(timezone.utc)
+            job_id, "complete",
+            completed_at=completed_at,
         )
         logger.info(
             "Job %s complete: verdict=%s confidence=%s",

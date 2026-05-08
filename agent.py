@@ -6,8 +6,8 @@ import time
 import uuid
 import logging
 
-import google.generativeai as genai
-from google.generativeai.types import FunctionDeclaration, Tool
+from google import genai
+from google.genai import types
 
 from tool_executor import execute_tool
 from malsight.config import GEMINI_API_KEY
@@ -32,14 +32,14 @@ JOB_STATUS: dict = {}
 
 # --- Category 1: Threat Intelligence Lookups ---
 
-check_malwarebazaar_fn = FunctionDeclaration(
+check_malwarebazaar_fn = types.FunctionDeclaration(
     name="check_malwarebazaar",
     description=(
         "Query MalwareBazaar for the file's SHA-256 hash. "
         "Call this VERY EARLY in any investigation — a hit returns the known "
         "malware family and means no sandbox execution is needed at all."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "hash": {"type": "string", "description": "SHA-256 hex string of the file"},
@@ -48,13 +48,13 @@ check_malwarebazaar_fn = FunctionDeclaration(
     },
 )
 
-check_virustotal_fn = FunctionDeclaration(
+check_virustotal_fn = types.FunctionDeclaration(
     name="check_virustotal",
     description=(
         "Query VirusTotal for multi-engine consensus on the file's SHA-256 hash. "
         "Use after MalwareBazaar miss for a broader detection signal."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "hash": {"type": "string", "description": "SHA-256 hex string of the file"},
@@ -63,14 +63,14 @@ check_virustotal_fn = FunctionDeclaration(
     },
 )
 
-check_ip_reputation_fn = FunctionDeclaration(
+check_ip_reputation_fn = types.FunctionDeclaration(
     name="check_ip_reputation",
     description=(
         "Query AbuseIPDB for an IPv4/IPv6 address. Call after IPs are extracted "
         "from strings, IOCs, or memory — confirms whether contacted hosts are "
         "known C2 / malicious infrastructure."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "ip": {"type": "string", "description": "IPv4 or IPv6 address"},
@@ -79,13 +79,13 @@ check_ip_reputation_fn = FunctionDeclaration(
     },
 )
 
-check_domain_reputation_fn = FunctionDeclaration(
+check_domain_reputation_fn = types.FunctionDeclaration(
     name="check_domain_reputation",
     description=(
         "Query threat intelligence feeds for a domain name. Call after a domain "
         "is extracted from the file or memory dump to flag C2/phishing infrastructure."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "domain": {"type": "string", "description": "Fully-qualified domain name"},
@@ -96,24 +96,24 @@ check_domain_reputation_fn = FunctionDeclaration(
 
 # --- Category 2: Static File Analysis ---
 
-get_file_magic_fn = FunctionDeclaration(
+get_file_magic_fn = types.FunctionDeclaration(
     name="get_file_magic",
     description=(
         "Detect the true file type via libmagic, ignoring the declared extension. "
         "Call early to confirm what you're really looking at (PE32+, PDF, ELF, "
         "OLE2, ZIP, script, etc.) — especially when extension and content may differ."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-get_entropy_fn = FunctionDeclaration(
+get_entropy_fn = types.FunctionDeclaration(
     name="get_entropy",
     description=(
         "Compute Shannon entropy for the whole file or a specific PE section. "
         "High entropy (> 7.0) strongly indicates packing or encryption. "
         "Use to confirm packing suspicion before calling detect_packer()."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "region": {
@@ -125,14 +125,14 @@ get_entropy_fn = FunctionDeclaration(
     },
 )
 
-extract_strings_fn = FunctionDeclaration(
+extract_strings_fn = types.FunctionDeclaration(
     name="extract_strings",
     description=(
         "Extract printable ASCII and UTF-16LE strings from the file on disk, "
         "returning all strings plus a security-relevant subset (URLs, IPs, "
         "registry keys, API names, paths). Useful for unpacked binaries and scripts."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "min_length": {"type": "integer", "description": "Minimum string length (default 6)"},
@@ -142,85 +142,85 @@ extract_strings_fn = FunctionDeclaration(
     },
 )
 
-get_pe_imports_fn = FunctionDeclaration(
+get_pe_imports_fn = types.FunctionDeclaration(
     name="get_pe_imports",
     description=(
         "Parse the PE import table and return imported DLLs and function names. "
         "Suspicious combinations (VirtualAllocEx + WriteProcessMemory + CreateRemoteThread) "
         "are near-definitive injection indicators. Call on any PE32/PE32+ sample."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-get_pe_sections_fn = FunctionDeclaration(
+get_pe_sections_fn = types.FunctionDeclaration(
     name="get_pe_sections",
     description=(
         "Return PE section headers (name, virtual size, raw size, entropy, flags). "
         "Abnormal section names (.upx0, .aspack), rwx flags, or high-entropy "
         "executable sections strongly suggest packing or self-modification."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-detect_packer_fn = FunctionDeclaration(
+detect_packer_fn = types.FunctionDeclaration(
     name="detect_packer",
     description=(
         "Identify the specific packer/protector (UPX, MPRESS, Themida, ASPack, "
         "VMProtect, Enigma) and estimate decompression time. Call after entropy "
         "indicates packing — knowing the packer tells you when to capture memory."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-check_digital_signature_fn = FunctionDeclaration(
+check_digital_signature_fn = types.FunctionDeclaration(
     name="check_digital_signature",
     description=(
         "Verify the PE Authenticode digital signature and certificate chain. "
         "Forged, expired, or self-signed certificates that claim a major vendor "
         "are a significant red flag. Call on any signed PE."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-get_compile_timestamp_fn = FunctionDeclaration(
+get_compile_timestamp_fn = types.FunctionDeclaration(
     name="get_compile_timestamp",
     description=(
         "Extract the PE compile timestamp; flag zeroed or suspiciously round "
         "values (common faking technique). Cheap signal — use opportunistically on PEs."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-analyze_pdf_structure_fn = FunctionDeclaration(
+analyze_pdf_structure_fn = types.FunctionDeclaration(
     name="analyze_pdf_structure",
     description=(
         "Deep PDF structural analysis — extracts JavaScript objects, embedded "
         "files, suspicious actions (/Launch, /JavaScript, /OpenAction), and "
         "filter chains. Call first whenever the file is a PDF."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-deobfuscate_script_fn = FunctionDeclaration(
+deobfuscate_script_fn = types.FunctionDeclaration(
     name="deobfuscate_script",
     description=(
         "Statically deobfuscate Python / JavaScript / PowerShell / shell scripts "
         "(base64, hex, string concat, simple eval chains). Call on any script "
         "file before judging it benign — obfuscation usually hides malicious payload."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
 # --- Category 3: Sandbox Execution ---
 
-run_sandbox_fn = FunctionDeclaration(
+run_sandbox_fn = types.FunctionDeclaration(
     name="run_sandbox",
     description=(
         "Execute the target file in an isolated Docker container under strace and Falco. "
         "Returns behavioral summary (file ops, network attempts, child processes, Falco events). "
         "Only call after static analysis suggests it's needed — sandbox execution is expensive."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "duration": {
@@ -236,14 +236,14 @@ run_sandbox_fn = FunctionDeclaration(
     },
 )
 
-capture_memory_dump_fn = FunctionDeclaration(
+capture_memory_dump_fn = types.FunctionDeclaration(
     name="capture_memory_dump",
     description=(
         "Capture a gcore memory dump of the running sandboxed process at "
         "`timing` seconds after execution start. Time the dump to land just "
         "after packer decompression for the best chance of seeing the real payload."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "timing": {
@@ -255,36 +255,36 @@ capture_memory_dump_fn = FunctionDeclaration(
     },
 )
 
-monitor_filesystem_fn = FunctionDeclaration(
+monitor_filesystem_fn = types.FunctionDeclaration(
     name="monitor_filesystem",
     description=(
         "Capture real-time filesystem change events (inotifywait) during sandbox "
         "execution — every file created/modified/deleted by the sample. Useful "
         "for catching droppers."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-get_dropped_files_fn = FunctionDeclaration(
+get_dropped_files_fn = types.FunctionDeclaration(
     name="get_dropped_files",
     description=(
         "Retrieve content, SHA-256 hashes, and MIME types of files dropped by "
         "the sample during sandbox execution. Call after monitor_filesystem() "
         "reports new files."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
 # --- Category 4: Memory Forensics ---
 
-scan_pe_headers_fn = FunctionDeclaration(
+scan_pe_headers_fn = types.FunctionDeclaration(
     name="scan_pe_headers",
     description=(
         "Scan the memory dump for embedded PE images (MZ + PE signatures). "
         "Any PE found at a non-zero offset is a likely injected DLL or hollowed payload. "
         "Call after capture_memory_dump() on any packed or suspicious sample."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "target": {
@@ -296,14 +296,14 @@ scan_pe_headers_fn = FunctionDeclaration(
     },
 )
 
-extract_strings_from_memory_fn = FunctionDeclaration(
+extract_strings_from_memory_fn = types.FunctionDeclaration(
     name="extract_strings_from_memory",
     description=(
         "Extract strings from the memory dump that were not present on disk — "
         "decrypted C2 URLs, registry keys, API names, etc. Filter by 'ioc', "
         "'registry', 'api', or 'all'. The single most valuable post-dump tool."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "filter": {
@@ -315,24 +315,24 @@ extract_strings_from_memory_fn = FunctionDeclaration(
     },
 )
 
-detect_shellcode_fn = FunctionDeclaration(
+detect_shellcode_fn = types.FunctionDeclaration(
     name="detect_shellcode",
     description=(
         "Scan the memory dump for shellcode patterns (PEB walk, ROR-13 hash "
         "loops, indirect call-register, NOP sleds). Call when injection is "
         "suspected but no full PE is visible."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-get_memory_entropy_fn = FunctionDeclaration(
+get_memory_entropy_fn = types.FunctionDeclaration(
     name="get_memory_entropy",
     description=(
         "Per-region entropy across the memory dump. Persistently high entropy "
         "in an executable region post-decompression points to a second-stage "
         "payload still encoded in memory."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "region": {
@@ -344,14 +344,14 @@ get_memory_entropy_fn = FunctionDeclaration(
     },
 )
 
-analyze_injected_pe_fn = FunctionDeclaration(
+analyze_injected_pe_fn = types.FunctionDeclaration(
     name="analyze_injected_pe",
     description=(
         "Extract the PE image at the given memory offset and run the full static "
         "analysis suite (imports, sections, strings, packer) against it. This is "
         "how you investigate the actual payload independent of the loader."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "offset": {
@@ -363,14 +363,14 @@ analyze_injected_pe_fn = FunctionDeclaration(
     },
 )
 
-run_yara_fn = FunctionDeclaration(
+run_yara_fn = types.FunctionDeclaration(
     name="run_yara",
     description=(
         "Run named YARA rule sets ('ransomware', 'banker', 'rat', 'coinminer', "
         "'webshell') against the file or memory dump. Returns matched rules and "
         "trigger byte patterns. Cheap signal — use whenever you suspect a family."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "rules": {
@@ -389,17 +389,17 @@ run_yara_fn = FunctionDeclaration(
 
 # --- Category 5: Anti-Analysis Detection ---
 
-detect_anti_debug_fn = FunctionDeclaration(
+detect_anti_debug_fn = types.FunctionDeclaration(
     name="detect_anti_debug",
     description=(
         "Detect anti-debugging techniques (IsDebuggerPresent, RDTSC timing, "
         "NtQueryInformationProcess debug-port checks, SEH tricks). Their presence "
         "is itself a malware indicator and a hint to dump memory rather than trace."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-detect_anti_vm_fn = FunctionDeclaration(
+detect_anti_vm_fn = types.FunctionDeclaration(
     name="detect_anti_vm",
     description=(
         "Detect VM-detection techniques (CPUID hypervisor bit, VMware/VBox "
@@ -407,29 +407,29 @@ detect_anti_vm_fn = FunctionDeclaration(
         "Anti-VM samples often behave benignly in sandboxes — call this when a "
         "sandbox run produced a near-empty trace."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
-detect_anti_sandbox_fn = FunctionDeclaration(
+detect_anti_sandbox_fn = types.FunctionDeclaration(
     name="detect_anti_sandbox",
     description=(
         "Detect sandbox-evasion techniques (long sleeps, mouse-movement checks, "
         "low-process-count checks, recently-accessed-file probes). Call when "
         "sandbox execution produced suspiciously little behavior."
     ),
-    parameters={"type": "object", "properties": {}, "required": []},
+    parameters_json_schema={"type": "object", "properties": {}, "required": []},
 )
 
 # --- Category 6: IOC Extraction & Control ---
 
-extract_iocs_fn = FunctionDeclaration(
+extract_iocs_fn = types.FunctionDeclaration(
     name="extract_iocs",
     description=(
         "Extract all IOCs (IPs, URLs, domains, emails, crypto wallets, mutexes) "
         "from the file on disk or the memory dump, deduplicated and categorized. "
         "Run before reputation checks so you know what to enrich."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "target": {
@@ -441,7 +441,7 @@ extract_iocs_fn = FunctionDeclaration(
     },
 )
 
-get_report_fn = FunctionDeclaration(
+get_report_fn = types.FunctionDeclaration(
     name="get_report",
     description=(
         "Signal that the investigation is complete. Call this only when you have "
@@ -449,7 +449,7 @@ get_report_fn = FunctionDeclaration(
         "verdict, confidence, threat_category, severity, summary, key_indicators, "
         "mitre_techniques, recommended_action, iocs. This terminates the agent loop."
     ),
-    parameters={
+    parameters_json_schema={
         "type": "object",
         "properties": {
             "verdict": {
@@ -505,7 +505,7 @@ get_report_fn = FunctionDeclaration(
 
 
 # Single Tool object containing all 30 declarations (29 analysis tools + get_report).
-malsight_tools = Tool(
+malsight_tools = types.Tool(
     function_declarations=[
         check_malwarebazaar_fn,
         check_virustotal_fn,
@@ -617,6 +617,10 @@ def build_system_prompt(mode: str) -> str:
         "7. When you call get_report(), provide your final verdict, confidence,\n"
         "   threat category, severity, summary, key indicators, and MITRE ATT&CK\n"
         "   technique mappings as a structured JSON object.\n"
+        "8. If the file is a .zip, do not attempt static PE analysis on the zip\n"
+        "   itself. Call run_sandbox() — extraction happens inside the isolated\n"
+        "   container via 7z. The zip password for MalwareBazaar samples is\n"
+        "   'infected' and is applied automatically.\n"
         "\n"
         "You have the following tools available:\n"
         f"{_TOOL_CATALOG_SUMMARY}"
@@ -624,22 +628,12 @@ def build_system_prompt(mode: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gemini model builder
+# Gemini client builder
 # ---------------------------------------------------------------------------
 
-def build_model(mode: str):
-    """Configure and return a Gemini GenerativeModel for the given mode."""
-    genai.configure(api_key=GEMINI_API_KEY())
-
-    return genai.GenerativeModel(
-        model_name="gemini-1.5-pro",
-        tools=[malsight_tools],
-        generation_config=genai.GenerationConfig(
-            temperature=0.2,
-            max_output_tokens=1024,
-        ),
-        system_instruction=build_system_prompt(mode),
-    )
+def build_client() -> genai.Client:
+    """Return a Gemini client initialized with the configured API key."""
+    return genai.Client(api_key=GEMINI_API_KEY())
 
 
 # ---------------------------------------------------------------------------
@@ -850,15 +844,15 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
     job_id = job_id or str(uuid.uuid4())
     max_iters = MAX_ITERATIONS[mode]
 
-    model = build_model(mode)
+    client = build_client()
     history: list = []
     reasoning_chain: list = []
     iterations = 0
 
-    initial_message = {
-        "role": "user",
-        "parts": [
-            (
+    history.append(
+        types.Content(
+            role="user",
+            parts=[types.Part(text=(
                 "Analyze this file.\n"
                 f"Filename: {file_meta.get('filename','?')}\n"
                 f"SHA-256: {file_meta.get('sha256','?')}\n"
@@ -867,10 +861,9 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
                 f"On-disk entropy: {file_meta.get('entropy','?')}\n"
                 f"Mode: {mode}\n"
                 "Begin your investigation."
-            )
-        ],
-    }
-    history.append(initial_message)
+            ))],
+        )
+    )
 
     update_job_status(job_id, 0, "Step 0 — Briefing the agent on initial file metadata...", start_time)
 
@@ -885,7 +878,16 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
         )
 
         try:
-            response = model.generate_content(history)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=history,
+                config=types.GenerateContentConfig(
+                    tools=[malsight_tools],
+                    system_instruction=build_system_prompt(mode),
+                    temperature=0.2,
+                    max_output_tokens=16000,
+                ),
+            )
         except Exception as e:
             logger.exception("Gemini API call failed at iteration %d", iterations)
             raise
@@ -894,30 +896,31 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
             candidate = response.candidates[0].content
         except (AttributeError, IndexError, TypeError) as e:
             logger.warning("Malformed Gemini response at iter %d: %s", iterations, e)
-            history.append({
-                "role": "user",
-                "parts": [
-                    "Your previous response was malformed. Please call a tool to "
-                    "continue the investigation, or call get_report() if you have enough evidence."
-                ],
-            })
+            history.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=(
+                        "Your previous response was malformed. Please call a tool to "
+                        "continue the investigation, or call get_report() if you have enough evidence."
+                    ))],
+                )
+            )
             continue
 
-        history.append({"role": "model", "parts": candidate.parts})
+        history.append(response.candidates[0].content)
 
         # Extract reasoning text (text parts, in order, before tool calls)
         reasoning_text = " ".join(
             part.text
             for part in candidate.parts
-            if getattr(part, "text", None)
+            if part.text
         ).strip()
 
-        # Extract function calls — guard against malformed parts
+        # Extract function calls
         tool_calls = []
         for part in candidate.parts:
-            fc = getattr(part, "function_call", None)
-            if fc and getattr(fc, "name", None):
-                tool_calls.append(fc)
+            if part.function_call and part.function_call.name:
+                tool_calls.append(part.function_call)
 
         if not tool_calls:
             update_job_status(
@@ -926,15 +929,15 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
                 f"Step {iterations} — Agent produced text only; nudging toward tool call...",
                 start_time,
             )
-            history.append({
-                "role": "user",
-                "parts": [
-                    "Please call a tool to continue, or call get_report() if you have enough evidence."
-                ],
-            })
+            history.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text="Please call a tool to continue, or call get_report() if you have enough evidence.")],
+                )
+            )
             continue
 
-        tool_results = []
+        tool_result_parts = []
         for call in tool_calls:
             tool_name = call.name
             tool_params = _normalize_args(getattr(call, "args", {}))
@@ -973,7 +976,7 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
             )
 
             try:
-                result = execute_tool(tool_name, tool_params, file_path)
+                result = execute_tool(tool_name, tool_params, file_path, file_meta)
             except Exception as e:
                 logger.exception("execute_tool raised for %s", tool_name)
                 result = {"error": str(e), "tool": tool_name}
@@ -990,14 +993,16 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
                 "result_summary": _summarize_result(tool_name, result),
             })
 
-            tool_results.append({
-                "function_response": {
-                    "name": tool_name,
-                    "response": result,
-                }
-            })
+            tool_result_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name=tool_name,
+                        response=result,
+                    )
+                )
+            )
 
-        history.append({"role": "user", "parts": tool_results})
+        history.append(types.Content(role="user", parts=tool_result_parts))
 
     # Max iterations reached without get_report() — force-terminate.
     update_job_status(

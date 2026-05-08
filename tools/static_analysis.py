@@ -69,6 +69,21 @@ _SUSPICIOUS_BYTE_PATTERNS = [
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _zip_note(file_path: str) -> str | None:
+    """Return a standard note when the target is a zip; None otherwise."""
+    try:
+        import zipfile
+        if zipfile.is_zipfile(file_path):
+            return "zip file — contents analyzed inside sandbox only"
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Public tools
 # ---------------------------------------------------------------------------
 
@@ -78,7 +93,11 @@ def get_file_magic(file_path: str) -> dict:
         import magic
         magic_type = magic.from_file(file_path)
         mime = magic.from_file(file_path, mime=True)
-        return {"magic_type": magic_type, "mime": mime}
+        result = {"magic_type": magic_type, "mime": mime}
+        note = _zip_note(file_path)
+        if note:
+            result["note"] = note
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -106,6 +125,9 @@ def get_entropy(file_path: str, region: str = None) -> dict:
             result["sections"] = sections
         if region and region in sections:
             result["region_entropy"] = sections[region]
+        note = _zip_note(file_path)
+        if note:
+            result["note"] = note
         return result
     except Exception as e:
         return {"error": str(e)}
@@ -137,10 +159,14 @@ def extract_strings(file_path: str, min_length: int = 6, encoding: str = None) -
                     suspicious.append(decoded)
                     seen.add(decoded)
 
-        return {
+        result = {
             "total_strings": len(all_strings),
             "suspicious": suspicious[:100],
         }
+        note = _zip_note(file_path)
+        if note:
+            result["note"] = note
+        return result
     except Exception as e:
         return {"error": str(e)}
 
