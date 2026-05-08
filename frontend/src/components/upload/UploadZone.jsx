@@ -52,6 +52,12 @@ export default function UploadZone({ onFile, onPasteHash, droppedFile, mode, set
     );
   }
 
+  // Show mode selector even before file drop
+  const modeOptions = [
+    { id: 'standard', label: 'Standard', icon: '⚡', desc: 'Fast triage ~60s' },
+    { id: 'deep', label: 'Deep Scan', icon: '🔬', desc: 'Thorough ~5min' },
+  ];
+
   return (
     <div>
       <div
@@ -110,6 +116,44 @@ export default function UploadZone({ onFile, onPasteHash, droppedFile, mode, set
             </button>
           </div>
         </div>
+      </div>
+
+      {/* Scan mode selector */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12, marginTop: 16 }}>
+        {modeOptions.map((opt) => {
+          const active = mode === opt.id;
+          return (
+            <button
+              key={opt.id}
+              onClick={() => setMode(opt.id)}
+              className="focusable"
+              style={{
+                padding: '14px 16px',
+                borderRadius: 8,
+                background: active ? 'var(--bg-raised)' : 'var(--bg-subtle)',
+                border: `1.5px solid ${active ? 'var(--amber-400)' : 'var(--border)'}`,
+                color: active ? 'var(--amber-400)' : 'var(--text-secondary)',
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+                fontSize: 13,
+                fontWeight: 500,
+                transition: 'all 150ms ease',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'flex-start',
+                gap: 4,
+              }}
+            >
+              <span style={{ fontSize: 18, marginBottom: 4 }}>{opt.icon}</span>
+              <span style={{ fontSize: 13, fontWeight: 600, color: active ? 'var(--amber-400)' : 'var(--text-primary)' }}>
+                {opt.label}
+              </span>
+              <span style={{ fontSize: 11, color: active ? 'var(--amber-400)' : 'var(--text-muted)' }}>
+                {opt.desc}
+              </span>
+            </button>
+          );
+        })}
       </div>
 
       {hashOpen && (
