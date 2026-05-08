@@ -45,8 +45,18 @@ def _get_env_or_error() -> tuple:
     return image, project, cluster, zone
 
 
-def run_sandbox(file_path: str, duration: int = 30, capture_focus: str = "all") -> dict:
-    """Execute file in a GKE gVisor Job; parse strace output from pod logs."""
+def run_sandbox(
+    file_path: str,
+    duration: int = 30,
+    capture_focus: str = "all",
+    is_zip: bool = False,
+    zip_password: str = "infected",
+) -> dict:
+    """Execute file in a GKE gVisor Job; parse strace output from pod logs.
+
+    If is_zip=True the zip is extracted *inside* the container by 7z before
+    execution — the host filesystem never sees the malware binary.
+    """
     try:
         image, _project, _cluster, _zone = _get_env_or_error()
         _load_kube_config()
@@ -70,8 +80,9 @@ def run_sandbox(file_path: str, duration: int = 30, capture_focus: str = "all") 
     }.get(capture_focus, "-f")
 
     try:
+        import base64
         with open(file_path, "rb") as fh:
-            sample_data = fh.read()
+            sample_data = base64.b64encode(fh.read()).decode("utf-8")
     except OSError as e:
         return {"error": f"sandbox not available: cannot read sample: {e}"}
 
@@ -88,16 +99,33 @@ def run_sandbox(file_path: str, duration: int = 30, capture_focus: str = "all") 
     except Exception as e:
         return {"error": f"sandbox not available: ConfigMap creation failed: {e}"}
 
-    command = [
-        "/bin/sh", "-c",
-        (
-            f"cp /sample/sample /tmp/target && "
-            f"chmod +x /tmp/target && "
-            f"timeout {duration} strace {strace_filter} -o /tmp/strace.log /tmp/target "
-            f"> /tmp/output.log 2>&1; "
-            f"cat /tmp/strace.log"
-        ),
-    ]
+    if is_zip:
+        # Extraction happens entirely inside the gVisor container — the host
+        # filesystem never sees the malware binary.
+        command = [
+            "/bin/sh", "-c",
+            (
+                f"cp /sample/sample /tmp/sample.zip && "
+                f"7z x -p{zip_password} /tmp/sample.zip -o/tmp/extracted/ && "
+                f"EXTRACTED=$(find /tmp/extracted -maxdepth 3 -type f -perm /111 | head -1) && "
+                f"[ -z \"$EXTRACTED\" ] && EXTRACTED=$(find /tmp/extracted -maxdepth 3 -type f | head -1) ; "
+                f"chmod +x \"$EXTRACTED\" && "
+                f"timeout {duration} strace {strace_filter} -o /tmp/strace.log -f \"$EXTRACTED\" "
+                f"> /tmp/output.log 2>&1; "
+                f"cat /tmp/strace.log"
+            ),
+        ]
+    else:
+        command = [
+            "/bin/sh", "-c",
+            (
+                f"cp /sample/sample /tmp/target && "
+                f"chmod +x /tmp/target && "
+                f"timeout {duration} strace {strace_filter} -o /tmp/strace.log /tmp/target "
+                f"> /tmp/output.log 2>&1; "
+                f"cat /tmp/strace.log"
+            ),
+        ]
 
     job_body = k8s_client.V1Job(
         metadata=k8s_client.V1ObjectMeta(name=job_name, namespace=namespace),

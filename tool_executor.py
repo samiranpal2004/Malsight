@@ -17,8 +17,14 @@ from tools.anti_analysis import detect_anti_debug, detect_anti_vm, detect_anti_s
 from tools.ioc import extract_iocs, get_report
 
 
-def execute_tool(tool_name: str, params: dict, file_path: str) -> dict:
+def execute_tool(
+    tool_name: str,
+    params: dict,
+    file_path: str,
+    file_meta: dict = None,
+) -> dict:
     """Dispatch a tool call by name to its implementation; return structured JSON result."""
+    _meta = file_meta or {}
 
     dispatch = {
         # --- Threat Intelligence ---
@@ -48,6 +54,8 @@ def execute_tool(tool_name: str, params: dict, file_path: str) -> dict:
                                     file_path,
                                     p.get("duration", 30),
                                     p.get("capture_focus", "all"),
+                                    _meta.get("is_zip", False),
+                                    _meta.get("zip_password", "infected"),
                                 ),
         "capture_memory_dump": lambda p: capture_memory_dump(p.get("timing", 5)),
         "monitor_filesystem":  lambda p: monitor_filesystem(file_path),

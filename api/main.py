@@ -1,4 +1,6 @@
 # Phase 4: FastAPI application entrypoint.
+from dotenv import load_dotenv
+load_dotenv(override=True)  # Load .env variables, allowing override (e.g. from environment or secrets manager)
 import asyncio
 import logging
 import os
@@ -32,28 +34,18 @@ app.include_router(router)
 
 @app.on_event("startup")
 async def _startup_checks() -> None:
-    """Verify external dependencies and initialize DB schema on boot.
-
-    Degraded startup (unavailable DB / Redis) is logged as a warning but does
-    NOT crash the process — routes will return 503-style errors at call time.
-    """
     # ── PostgreSQL ──────────────────────────────────────────────────────────
     try:
         from api.db import init_tables
-
         await asyncio.to_thread(init_tables)
         logger.info("PostgreSQL: connected and tables initialized.")
     except Exception as exc:
         logger.warning("PostgreSQL unavailable on startup (will degrade): %s", exc)
 
-    # ── Redis ───────────────────────────────────────────────────────────────
-    try:
-        import redis as redis_lib
 
-        r = redis_lib.from_url(
-            os.environ.get("REDIS_URL", "redis://localhost:6379")
-        )
-        r.ping()
-        logger.info("Redis: connected.")
+# ── Redis ───────────────────────────────────────────────────────────────  
+    try:
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+        logger.info("Redis URL configured: %s", redis_url)
     except Exception as exc:
-        logger.warning("Redis unavailable on startup (will degrade): %s", exc)
+        logger.warning("Redis config error: %s", exc)

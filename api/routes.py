@@ -103,7 +103,10 @@ async def analyze(
     await asyncio.to_thread(_write_file, job_dir, file_path, data)
 
     # Persist job row
-    await asyncio.to_thread(db.insert_job, job_id, "queued", mode, filename, sha256)
+    await asyncio.to_thread(
+        db.insert_job, job_id, "queued", mode, filename, sha256,
+        len(data), file.content_type or "", file_path,
+    )
 
     # Enqueue RQ job (import here so worker module is only loaded when needed)
     from api.worker import analyze_file_job  # noqa: PLC0415 — deferred to avoid circular imports
@@ -188,7 +191,7 @@ async def get_report(
         return {
             "job_id": job_id,
             "status": "failed",
-            "error": job.get("error") or "Unknown error",
+            "error": job.get("error_message") or job.get("error") or "Unknown error",
         }
 
     # Catch-all for unexpected status values
@@ -230,34 +233,53 @@ async def list_reports(
 
 # ── GET /health ───────────────────────────────────────────────────────────────
 
+def _health_db() -> bool:
+    conn = db.get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        return True
+    except Exception as e:
+        print("DB health check failed:", e)
+        return False
+    finally:
+        conn.close()
+
+
 @router.get("/health")
 async def health() -> dict:
     """Service health check — no auth required."""
     db_connected = False
-    queue_depth = 0
+    queue_depth = -1
     workers_active = 0
-    overall = "ok"
 
-    # DB check
+    # DB check — fresh connection so we bypass any stale pool state
     try:
-        await asyncio.to_thread(db.get_job, "health-check-probe")
-        db_connected = True
-    except Exception:
+        db_connected = await asyncio.to_thread(_health_db)
+    except Exception as e:
+        print("DB health check failed:", e)
         db_connected = False
-        overall = "degraded"
 
-    # Redis + RQ check
+    # Redis + RQ check — read URL directly from env with a safe fallback so
+    # get_secret() failures don't silently zero out the worker count
+    redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
     try:
-        r = _redis()
-        r.ping()
-        q = Queue("malsight", connection=r)
-        queue_depth = q.count
-        workers_active = len(Worker.all(connection=r))
-    except Exception:
-        overall = "degraded"
+        from redis import Redis as RedisClient
+        conn = RedisClient.from_url(redis_url, socket_connect_timeout=5)
+        conn.ping()
+        q = Queue("malsight", connection=conn)
+        queue_depth = len(q)
+        workers_active = len(Worker.all(connection=conn))
+    except Exception as e:
+        print("Redis health check failed:", e)
+        queue_depth = -1
+        workers_active = 0
+
+    status = "ok" if db_connected else "degraded"
 
     return {
-        "status": overall,
+        "status": status,
         "queue_depth": queue_depth,
         "workers_active": workers_active,
         "db_connected": db_connected,

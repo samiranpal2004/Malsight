@@ -5,17 +5,36 @@ from malsight.config import VIRUSTOTAL_API_KEY, ABUSEIPDB_API_KEY
 
 
 def check_malwarebazaar(hash: str) -> dict:
-    """Query MalwareBazaar for a SHA-256 hash. Returns malware family and tags on a hit."""
     try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+        import os
+        api_key = os.getenv("MALWAREBAZAAR_API_KEY", "")
+
+        headers = {"Auth-Key": api_key} if api_key else {}
+
         resp = requests.post(
             "https://mb-api.abuse.ch/api/v1/",
+            headers=headers,
             data={"query": "get_info", "hash": hash},
             timeout=5,
         )
         data = resp.json()
-        if data.get("query_status") == "hash_not_found":
+
+        # API-level errors (Unauthorized, rate limit, etc.)
+        if "error" in data:
+            return {"found": False, "error": data["error"]}
+
+        # Not found
+        if data.get("query_status") in ("hash_not_found", "no_results"):
             return {"found": False}
-        entry = data.get("data", [{}])[0]
+
+        # Empty data
+        entries = data.get("data")
+        if not entries:
+            return {"found": False}
+
+        entry = entries[0]
         return {
             "found": True,
             "malware_family": entry.get("signature"),
@@ -25,7 +44,6 @@ def check_malwarebazaar(hash: str) -> dict:
         }
     except Exception as e:
         return {"found": False, "error": str(e)}
-
 
 def check_virustotal(hash: str) -> dict:
     """Query VirusTotal for multi-engine detection results on a SHA-256 hash."""

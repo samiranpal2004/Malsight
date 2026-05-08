@@ -1,13 +1,26 @@
 import axios from 'axios';
 
-const BASE_URL = import.meta.env?.VITE_API_BASE_URL ?? 'http://localhost:8000';
-const API_KEY = import.meta.env?.VITE_API_KEY ?? '';
-
 const api = axios.create({
-  baseURL: BASE_URL,
+  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000',
   headers: {
-    'X-API-Key': API_KEY,
+    'X-API-Key': import.meta.env.VITE_API_KEY || '',
   },
 });
+
+export const submitFile = (file, mode) => {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('mode', mode);
+  return api.post('/analyze', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+};
+
+export const getReport = (jobId) => api.get(`/report/${jobId}`);
+
+export const listReports = (page = 1, verdict = '', mode = '') =>
+  api.get('/reports', { params: { page, page_size: 20, verdict, mode } });
+
+export const getHealth = () => api.get('/health');
 
 export default api;
