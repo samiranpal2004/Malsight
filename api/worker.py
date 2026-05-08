@@ -10,12 +10,15 @@
 # in dev / single-process mode).
 # For multi-process production deployments, migrate live-step tracking to Redis or
 # add a current_step column to the jobs table so both processes can share state.
+from dotenv import load_dotenv
+load_dotenv(override=True)
 import hashlib
 import logging
 import os
 import shutil
 import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 
 # agent.run_agent() is the Phase 3 Gemini loop.  It calls agent.update_job_status()
 # internally, writing progress to agent.JOB_STATUS (same process only — see note above).
@@ -46,7 +49,7 @@ def analyze_file_job(
     6. On any exception: status="failed", log full traceback
     7. Always clean up /tmp/malsight_jobs/{job_id}/
     """
-    staging_dir = os.path.join("/tmp/malsight_jobs", job_id)
+    staging_dir = Path("/tmp/malsight_jobs") / job_id
 
     try:
         # ── Step 1 ──────────────────────────────────────────────────────────
@@ -124,6 +127,6 @@ def analyze_file_job(
             logger.exception("Could not update job %s status to failed", job_id)
 
     finally:  # ── Step 7 ────────────────────────────────────────────────────
-        if os.path.exists(staging_dir):
+        if staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
             logger.debug("Job %s: cleaned up staging dir %s", job_id, staging_dir)

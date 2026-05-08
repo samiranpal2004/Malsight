@@ -45,49 +45,7 @@ function IOCSection({ label, items }) {
   );
 }
 
-export default function Report() {
-  const { job_id } = useParams();
-  const [report, setReport] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    api
-      .get(`/report/${job_id}`)
-      .then(({ data }) => {
-        if (data.status === 'complete' && data.report) {
-          setReport(data.report);
-        } else if (data.status === 'failed') {
-          setError(data.error || 'Analysis failed.');
-        } else {
-          setError('Report is not yet complete. Please wait and refresh.');
-        }
-      })
-      .catch((err) => {
-        setError(err.response?.data?.detail || err.message || 'Failed to load report.');
-      })
-      .finally(() => setLoading(false));
-  }, [job_id]);
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-96 gap-3 text-gray-400">
-        <Loader2 className="w-5 h-5 animate-spin" />
-        Loading report…
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="max-w-4xl mx-auto px-6 py-12">
-        <div className="bg-red-900/30 border border-red-700 text-red-300 rounded-xl p-6">
-          {error}
-        </div>
-      </div>
-    );
-  }
-
+export function ReportContent({ report, showReasoningChain = true }) {
   const {
     verdict,
     confidence,
@@ -107,7 +65,6 @@ export default function Report() {
   const steps = reasoning_chain?.steps ?? [];
   const modeLabel = mode === 'deep_scan' ? 'Deep Scan' : 'Standard';
 
-  // Group MITRE techniques by tactic
   const byTactic = mitre_techniques.reduce((acc, t) => {
     const tactic = t.tactic || 'Other';
     (acc[tactic] ??= []).push(t);
@@ -122,16 +79,7 @@ export default function Report() {
     iocs.crypto_wallets?.length;
 
   return (
-    <div className="max-w-4xl mx-auto px-6 py-12 space-y-8">
-      {/* Back button */}
-      <Link
-        to="/"
-        className="inline-flex items-center gap-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
-      >
-        <ArrowLeft className="w-4 h-4" />
-        Back to Upload
-      </Link>
-
+    <div className="space-y-6">
       {/* Header row — verdict, severity, mode, stats */}
       <div className="flex flex-wrap items-center gap-3">
         <VerdictBadge verdict={verdict} confidence={confidence} />
@@ -225,9 +173,6 @@ export default function Report() {
         </div>
       ) : null}
 
-      {/* Reasoning Chain — collapsed by default */}
-      {steps.length > 0 && <ReasoningChain steps={steps} />}
-
       {/* Recommended Action banner */}
       {recommended_action && (
         <div
@@ -237,6 +182,66 @@ export default function Report() {
           Recommended Action: {recommended_action}
         </div>
       )}
+
+      {/* Reasoning Chain — only shown in standalone Report page */}
+      {showReasoningChain && steps.length > 0 && <ReasoningChain steps={steps} />}
+    </div>
+  );
+}
+
+export default function Report() {
+  const { job_id } = useParams();
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    api
+      .get(`/report/${job_id}`)
+      .then(({ data }) => {
+        if (data.status === 'complete' && data.report) {
+          setReport(data.report);
+        } else if (data.status === 'failed') {
+          setError(data.error || 'Analysis failed.');
+        } else {
+          setError('Report is not yet complete. Please wait and refresh.');
+        }
+      })
+      .catch((err) => {
+        setError(err.response?.data?.detail || err.message || 'Failed to load report.');
+      })
+      .finally(() => setLoading(false));
+  }, [job_id]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-96 gap-3 text-gray-400">
+        <Loader2 className="w-5 h-5 animate-spin" />
+        Loading report…
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="max-w-4xl mx-auto px-6 py-12">
+        <div className="bg-red-900/30 border border-red-700 text-red-300 rounded-xl p-6">
+          {error}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-4xl mx-auto px-6 py-12 space-y-8">
+      <Link
+        to="/"
+        className="inline-flex items-center gap-2 text-sm text-gray-400 hover:text-gray-200 transition-colors"
+      >
+        <ArrowLeft className="w-4 h-4" />
+        Back to Upload
+      </Link>
+      <ReportContent report={report} showReasoningChain={true} />
     </div>
   );
 }
