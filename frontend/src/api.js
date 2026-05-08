@@ -23,4 +23,22 @@ export const listReports = (page = 1, verdict = '', mode = '') =>
 
 export const getHealth = () => api.get('/health');
 
+// ── Mail / Email Gateway ──────────────────────────────────────────────────────
+
+export const getInbox = (recipient, page = 1, pageSize = 20) =>
+  api.get('/mail/inbox', { params: { recipient, page, page_size: pageSize } });
+
+export const getEmail = (emailId) => api.get(`/mail/email/${emailId}`);
+
+export const getAttachmentReport = (attachmentId) =>
+  api.get(`/mail/attachment/${attachmentId}/report`);
+
+export const getQuarantine = (page = 1, pageSize = 20) =>
+  api.get('/mail/quarantine', { params: { page, page_size: pageSize } });
+
+export const releaseQuarantine = (emailId) =>
+  api.post(`/mail/quarantine/${emailId}/release`);
+
+export const getMailStats = () => api.get('/mail/stats');
+
 export default api;
