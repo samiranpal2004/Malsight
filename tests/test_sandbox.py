@@ -1,8 +1,9 @@
-# Phase 2 unit tests for tools/sandbox.py
-# All Docker SDK calls are mocked — no real containers are started.
+# Unit tests for tools/sandbox.py (Kubernetes SDK backend)
+# All k8s API calls are mocked — no real cluster is contacted.
 import os
 import tempfile
-from unittest.mock import MagicMock, patch, PropertyMock
+import time
+from unittest.mock import MagicMock, patch, call
 
 import pytest
 
@@ -14,6 +15,43 @@ from tools.sandbox import (
     get_dropped_files,
 )
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_ENV = {
+    "SANDBOX_IMAGE": "gcr.io/test-project/malsight-sandbox:latest",
+    "GCP_PROJECT": "test-project",
+    "GKE_CLUSTER": "malsight-cluster",
+    "GKE_ZONE": "us-central1-a",
+}
+
+
+def _make_k8s_mocks(log_text: str = "", job_complete: bool = True):
+    """Return (mock_batch_api, mock_core_api) pre-configured for a normal run."""
+    batch_api = MagicMock()
+    core_api = MagicMock()
+
+    # Job status: Complete
+    cond = MagicMock()
+    cond.type = "Complete"
+    cond.status = "True"
+    job_status = MagicMock()
+    job_status.status.conditions = [cond] if job_complete else []
+    batch_api.read_namespaced_job_status.return_value = job_status
+
+    # Pod listing
+    pod = MagicMock()
+    pod.metadata.name = "malsight-sandbox-test-pod-abc"
+    pod_list = MagicMock()
+    pod_list.items = [pod]
+    core_api.list_namespaced_pod.return_value = pod_list
+
+    # Pod logs (strace output)
+    core_api.read_namespaced_pod_log.return_value = log_text
+
+    return batch_api, core_api
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -23,8 +61,9 @@ from tools.sandbox import (
 def reset_sandbox_state():
     """Reset shared module state before every test."""
     _sandbox_module._state.update({
-        "container": None,
-        "client": None,
+        "job_id": None,
+        "pod_name": None,
+        "namespace": "default",
         "results_dir": None,
         "file_path": None,
         "start_time": None,
@@ -41,50 +80,37 @@ def sample_file(tmp_path):
     return str(p)
 
 
-def _make_mock_docker(image_found: bool = True, container_exit_code: int = 0):
-    """Build a mock Docker client."""
-    client = MagicMock()
-    if not image_found:
-        import docker.errors
-        client.images.get.side_effect = docker.errors.ImageNotFound("not found")
-    else:
-        client.images.get.return_value = MagicMock()
-
-    container = MagicMock()
-    container.wait.return_value = {"StatusCode": container_exit_code}
-    container.logs.return_value = b""
-    container.exec_run.return_value = MagicMock(output=b"123")  # PID
-    client.containers.run.return_value = container
-    return client, container
-
-
 # ---------------------------------------------------------------------------
 # run_sandbox
 # ---------------------------------------------------------------------------
 
 class TestRunSandbox:
-    def test_docker_not_installed_returns_error(self, sample_file):
-        with patch.dict("sys.modules", {"docker": None}):
+    def test_env_vars_missing_returns_error(self, sample_file):
+        """Missing SANDBOX_IMAGE / GKE vars → error without touching k8s."""
+        with patch.dict(os.environ, {}, clear=True):
+            # Ensure none of the required vars are set
+            for k in _ENV:
+                os.environ.pop(k, None)
             result = run_sandbox(sample_file)
         assert "error" in result
         assert "sandbox not available" in result["error"]
 
-    def test_image_not_found_returns_error(self, sample_file):
-        import docker.errors
-        mock_client = MagicMock()
-        mock_client.images.get.side_effect = docker.errors.ImageNotFound("nope")
-        with patch("tools.sandbox._get_docker_client", return_value=mock_client):
+    def test_k8s_unreachable_returns_error(self, sample_file):
+        """_load_kube_config raising → sandbox not available error."""
+        with patch.dict(os.environ, _ENV), \
+             patch("tools.sandbox._load_kube_config",
+                   side_effect=Exception("no kubeconfig")):
             result = run_sandbox(sample_file)
         assert "error" in result
-        assert "malsight-sandbox" in result["error"]
+        assert "sandbox not available" in result["error"]
 
-    def test_successful_run_returns_summary(self, sample_file, tmp_path):
-        mock_client, mock_container = _make_mock_docker()
-        results_dir = str(tmp_path / "results")
-        os.makedirs(results_dir, exist_ok=True)
+    def test_successful_run_returns_summary(self, sample_file):
+        batch_api, core_api = _make_k8s_mocks(log_text="")
 
-        with patch("tools.sandbox._get_docker_client", return_value=mock_client), \
-             patch("tools.sandbox.tempfile.mkdtemp", return_value=results_dir):
+        with patch.dict(os.environ, _ENV), \
+             patch("tools.sandbox._load_kube_config"), \
+             patch("kubernetes.client.BatchV1Api", return_value=batch_api), \
+             patch("kubernetes.client.CoreV1Api", return_value=core_api):
             result = run_sandbox(sample_file, duration=5)
 
         assert "error" not in result
@@ -94,21 +120,19 @@ class TestRunSandbox:
         assert "processes_spawned" in result
         assert "falco_events" in result
 
-    def test_strace_log_parsed_correctly(self, sample_file, tmp_path):
-        mock_client, mock_container = _make_mock_docker()
-        results_dir = str(tmp_path / "res")
-        os.makedirs(results_dir, exist_ok=True)
-
-        trace_log = tmp_path / "res" / "trace.log"
-        trace_log.write_text(
+    def test_strace_log_parsed_correctly(self, sample_file):
+        strace_log = (
             'openat(AT_FDCWD, "/etc/passwd", O_RDONLY) = 3\n'
             'write(1, "hello", 5) = 5\n'
             'connect(3, ...) = -1 ECONNREFUSED\n'
             'execve("/bin/sh", ...) = 0\n'
         )
+        batch_api, core_api = _make_k8s_mocks(log_text=strace_log)
 
-        with patch("tools.sandbox._get_docker_client", return_value=mock_client), \
-             patch("tools.sandbox.tempfile.mkdtemp", return_value=results_dir):
+        with patch.dict(os.environ, _ENV), \
+             patch("tools.sandbox._load_kube_config"), \
+             patch("kubernetes.client.BatchV1Api", return_value=batch_api), \
+             patch("kubernetes.client.CoreV1Api", return_value=core_api):
             result = run_sandbox(sample_file, duration=5)
 
         assert result["file_ops"]["reads"] >= 1
@@ -116,13 +140,35 @@ class TestRunSandbox:
         assert result["network_attempts"]["count"] >= 1
         assert "sh" in result["processes_spawned"]
 
-    def test_docker_error_returns_error(self, sample_file):
-        mock_client = MagicMock()
-        mock_client.images.get.return_value = MagicMock()
-        mock_client.containers.run.side_effect = Exception("docker daemon error")
-        with patch("tools.sandbox._get_docker_client", return_value=mock_client):
+    def test_job_creation_error_returns_error(self, sample_file):
+        batch_api, core_api = _make_k8s_mocks()
+        batch_api.create_namespaced_job.side_effect = Exception("quota exceeded")
+
+        with patch.dict(os.environ, _ENV), \
+             patch("tools.sandbox._load_kube_config"), \
+             patch("kubernetes.client.BatchV1Api", return_value=batch_api), \
+             patch("kubernetes.client.CoreV1Api", return_value=core_api):
             result = run_sandbox(sample_file)
+
         assert "error" in result
+        assert "sandbox not available" in result["error"]
+
+    def test_job_cleanup_deletes_configmap_and_job(self, sample_file):
+        """After a successful run, both the Job and ConfigMap must be deleted."""
+        batch_api, core_api = _make_k8s_mocks(log_text="")
+
+        with patch.dict(os.environ, _ENV), \
+             patch("tools.sandbox._load_kube_config"), \
+             patch("kubernetes.client.BatchV1Api", return_value=batch_api), \
+             patch("kubernetes.client.CoreV1Api", return_value=core_api):
+            result = run_sandbox(sample_file, duration=5)
+
+        assert "error" not in result
+        batch_api.delete_namespaced_job.assert_called_once()
+        core_api.delete_namespaced_config_map.assert_called()
+        # ConfigMap delete called at least once (cleanup path; not the error path)
+        delete_calls = core_api.delete_namespaced_config_map.call_count
+        assert delete_calls >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -143,27 +189,34 @@ class TestCaptureMemoryDump:
         assert result["dump_size_bytes"] == 1024
         assert result["timing_seconds"] == 5
 
-    def test_active_container_triggers_gcore(self, tmp_path):
-        import time
-        dump = tmp_path / "memdump.bin"
-        dump.write_bytes(b"\x4D\x5A" + b"\x00" * 2046)
-
-        mock_container = MagicMock()
-        mock_container.exec_run.side_effect = [
-            MagicMock(output=b"42\n"),           # pgrep call
-            MagicMock(output=b""),               # gcore call
-        ]
+    def test_active_pod_triggers_gcore(self, tmp_path):
         _sandbox_module._state.update({
-            "container": mock_container,
-            "results_dir": str(tmp_path),
+            "pod_name": "malsight-sandbox-abc-pod",
+            "namespace": "default",
             "start_time": time.time(),
         })
 
-        with patch("tools.sandbox.os.path.exists", return_value=True), \
-             patch("tools.sandbox.os.path.getsize", return_value=2048):
+        dump_bytes = b"\x4D\x5A" + b"\x00" * 2046
+        # stream() is called three times: pgrep, gcore, cat
+        stream_responses = ["42\n", "", dump_bytes.decode("latin-1")]
+
+        mock_core_api = MagicMock()
+        mock_stream = MagicMock(side_effect=stream_responses)
+
+        with patch("tools.sandbox._load_kube_config"), \
+             patch("kubernetes.client.CoreV1Api", return_value=mock_core_api), \
+             patch("kubernetes.stream.stream", mock_stream), \
+             patch("tools.sandbox.os.makedirs"), \
+             patch("builtins.open", create=True) as mock_open:
+            mock_open.return_value.__enter__ = lambda s: s
+            mock_open.return_value.__exit__ = MagicMock(return_value=False)
+            mock_open.return_value.write = MagicMock()
+            _sandbox_module._state["dump_path"] = None  # ensure no early return
+
             result = capture_memory_dump(timing=0)
 
         assert result["captured"] is True
+        assert result["dump_size_bytes"] == len(dump_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -178,27 +231,39 @@ class TestMonitorFilesystem:
         assert "deleted" in result
         assert result["created"] == []
 
-    def test_active_container_exec_parsed(self):
-        inotify_output = (
-            b"CREATE /tmp/dropped.exe\n"
-            b"MODIFY /etc/crontab\n"
-            b"DELETE /tmp/original.sh\n"
-        )
-        mock_container = MagicMock()
-        mock_container.exec_run.return_value = MagicMock(output=inotify_output)
-        _sandbox_module._state["container"] = mock_container
+    def test_active_pod_exec_parsed(self):
+        _sandbox_module._state["pod_name"] = "malsight-sandbox-abc-pod"
+        _sandbox_module._state["namespace"] = "default"
 
-        result = monitor_filesystem()
+        inotify_output = (
+            "CREATE /tmp/dropped.exe\n"
+            "MODIFY /etc/crontab\n"
+            "DELETE /tmp/original.sh\n"
+        )
+        mock_core_api = MagicMock()
+        mock_stream = MagicMock(return_value=inotify_output)
+
+        with patch("tools.sandbox._load_kube_config"), \
+             patch("kubernetes.client.CoreV1Api", return_value=mock_core_api), \
+             patch("kubernetes.stream.stream", mock_stream):
+            result = monitor_filesystem()
+
         assert "/tmp/dropped.exe" in result["created"]
         assert "/etc/crontab" in result["modified"]
         assert "/tmp/original.sh" in result["deleted"]
 
-    def test_container_exec_error_returns_error(self):
-        mock_container = MagicMock()
-        mock_container.exec_run.side_effect = Exception("container dead")
-        _sandbox_module._state["container"] = mock_container
+    def test_pod_exec_error_returns_error(self):
+        _sandbox_module._state["pod_name"] = "malsight-sandbox-abc-pod"
+        _sandbox_module._state["namespace"] = "default"
 
-        result = monitor_filesystem()
+        mock_core_api = MagicMock()
+        mock_stream = MagicMock(side_effect=Exception("pod dead"))
+
+        with patch("tools.sandbox._load_kube_config"), \
+             patch("kubernetes.client.CoreV1Api", return_value=mock_core_api), \
+             patch("kubernetes.stream.stream", mock_stream):
+            result = monitor_filesystem()
+
         assert "error" in result
 
 
@@ -226,6 +291,6 @@ class TestGetDroppedFiles:
     def test_nonexistent_file_skipped(self, tmp_path):
         _sandbox_module._state["created_files"] = ["/nonexistent/ghost.exe"]
         _sandbox_module._state["results_dir"] = str(tmp_path)
-        _sandbox_module._state["container"] = None  # no container to copy from
+        _sandbox_module._state["pod_name"] = None  # no pod to copy from
         result = get_dropped_files()
         assert result == []
