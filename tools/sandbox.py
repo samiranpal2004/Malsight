@@ -3,6 +3,8 @@
 import hashlib
 import os
 import re
+
+from malsight.config import SANDBOX_IMAGE, GCP_PROJECT, GKE_CLUSTER, GKE_ZONE
 import tempfile
 import time
 import uuid
@@ -31,13 +33,12 @@ def _load_kube_config() -> None:
 
 def _get_env_or_error() -> tuple:
     """Return (image, project, cluster, zone) or raise RuntimeError on missing vars."""
-    image = os.environ.get("SANDBOX_IMAGE")
-    project = os.environ.get("GCP_PROJECT")
-    cluster = os.environ.get("GKE_CLUSTER")
-    zone = os.environ.get("GKE_ZONE")
+    image = SANDBOX_IMAGE()  # raises RuntimeError if secret unavailable
+    project = GCP_PROJECT()
+    cluster = GKE_CLUSTER()
+    zone = GKE_ZONE()
     missing = [k for k, v in [
-        ("SANDBOX_IMAGE", image), ("GCP_PROJECT", project),
-        ("GKE_CLUSTER", cluster), ("GKE_ZONE", zone),
+        ("GCP_PROJECT", project), ("GKE_CLUSTER", cluster), ("GKE_ZONE", zone),
     ] if not v]
     if missing:
         raise RuntimeError(f"missing env vars: {', '.join(missing)}")

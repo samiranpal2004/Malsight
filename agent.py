@@ -2,7 +2,6 @@
 # See PRD Section 5 (Agent Brain), Section 7 (Modes), Section 8 (Report schema),
 # Appendix A (Tool calling reference), Appendix B (Agent loop).
 import json
-import os
 import time
 import uuid
 import logging
@@ -11,6 +10,7 @@ import google.generativeai as genai
 from google.generativeai.types import FunctionDeclaration, Tool
 
 from tool_executor import execute_tool
+from malsight.config import GEMINI_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -629,13 +629,7 @@ def build_system_prompt(mode: str) -> str:
 
 def build_model(mode: str):
     """Configure and return a Gemini GenerativeModel for the given mode."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY environment variable is not set. "
-            "Export it before running the agent."
-        )
-    genai.configure(api_key=api_key)
+    genai.configure(api_key=GEMINI_API_KEY())
 
     return genai.GenerativeModel(
         model_name="gemini-1.5-pro",

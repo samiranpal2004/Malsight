@@ -1,7 +1,6 @@
 # Phase 4: PostgreSQL helpers using psycopg2 (sync — correct for RQ worker context).
 # FastAPI async routes call these via asyncio.to_thread() to avoid blocking the event loop.
 import json
-import os
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any
@@ -10,17 +9,15 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 
+from malsight.config import DATABASE_URL
+
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pool
     if _pool is None:
-        url = os.environ.get(
-            "DATABASE_URL",
-            "postgresql://malsight:malsight@localhost:5432/malsight",
-        )
-        _pool = psycopg2.pool.ThreadedConnectionPool(2, 20, url)
+        _pool = psycopg2.pool.ThreadedConnectionPool(2, 20, DATABASE_URL())
     return _pool
 
 

@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Form, Header, HTTPException, Request, Uploa
 from rq import Queue, Worker
 
 from api import db
+from malsight.config import MALSIGHT_API_KEYS, REDIS_URL
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +36,13 @@ ESTIMATED_SECONDS = {"standard": 60, "deep_scan": 300}
 
 def _require_api_key(x_api_key: str | None) -> None:
     """Raise 401 if the X-API-Key header is missing or not in MALSIGHT_API_KEYS."""
-    raw = os.environ.get("MALSIGHT_API_KEYS", "")
-    valid = {k.strip() for k in raw.split(",") if k.strip()}
+    valid = {k.strip() for k in MALSIGHT_API_KEYS() if k.strip()}
     if not x_api_key or x_api_key not in valid:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 
 
 def _redis() -> redis_lib.Redis:
-    return redis_lib.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379"))
+    return redis_lib.from_url(REDIS_URL())
 
 
 def _queue() -> Queue:
