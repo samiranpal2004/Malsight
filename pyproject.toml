@@ -18,6 +18,7 @@ pefile = "^2024.8"
 pikepdf = "^9.0"
 yara-python = "^4.5"
 docker = "^7.1"
+kubernetes = ">=28.1.0"
 signify = "^0.5"
 google-generativeai = ">=0.5.0"
 fastapi = { version = ">=0.111.0", extras = ["standard"] }
