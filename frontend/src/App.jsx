@@ -7,97 +7,191 @@ import UploadZone from './components/upload/UploadZone.jsx';
 import ActiveJobPage from './components/active/ActiveJobPage.jsx';
 import ReportPage from './components/reports/ReportPage.jsx';
 import { IconList, IconArrowRight } from './components/icons/index.jsx';
-import { demoJob, recentScansSeed, bytesToLabel, detectType } from './data/demoData.js';
+import api from './api.js';
+
+const bytesToLabel = (bytes) => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+const detectType = (filename) => {
+  const ext = filename.split('.').pop().toLowerCase();
+  const types = {
+    exe: 'PE32+', dll: 'PE32+', py: 'Python', sh: 'Bash', bash: 'Bash',
+    pdf: 'PDF', zip: 'Archive',
+  };
+  return types[ext] || 'Unknown';
+};
+
+const formatTime = (isoStr) => {
+  if (!isoStr) return 'Unknown';
+  const date = new Date(isoStr);
+  const now = new Date();
+  const diffMs = now - date;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+
+  if (diffMins < 1) return 'Just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return date.toLocaleDateString();
+};
+
+const transformReportForTable = (item) => ({
+  name: item.filename,
+  kind: detectType(item.filename),
+  verdict: item.verdict ? item.verdict.toLowerCase() : 'unknown',
+  time: formatTime(item.created_at),
+  mode: item.mode === 'deep_scan' ? 'Deep' : 'Std',
+  job_id: item.job_id,
+  ...item,
+});
 
 export default function App() {
   const [route, setRoute] = useState('upload');       // 'upload' | 'active' | 'reports' | 'intel'
   const [jobState, setJobState] = useState('idle');   // idle | scanning | done
   const [droppedFile, setDroppedFile] = useState(null);
-  const [mode, setMode] = useState('deep');
+  const [currentJobId, setCurrentJobId] = useState(null);
+  const [mode, setMode] = useState('standard');
   const [progress, setProgress] = useState(0);
   const [completedSteps, setCompletedSteps] = useState(0);
   const [liveText, setLiveText] = useState('');
   const [usedTools, setUsedTools] = useState(0);
-  const [recent, setRecent] = useState(recentScansSeed);
+  const [recent, setRecent] = useState([]);
+  const [currentReport, setCurrentReport] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
 
-  const job = demoJob;
+  // Fetch recent reports on mount
+  useEffect(() => {
+    const fetchReports = async () => {
+      try {
+        const response = await api.get('/reports', { params: { page: 1, page_size: 20 } });
+        const items = response.data.items || [];
+        setRecent(items.map(transformReportForTable));
+      } catch (err) {
+        console.error('Failed to fetch reports:', err);
+      }
+    };
+    fetchReports();
+  }, []);
+
+  // Poll for job status while scanning
+  useEffect(() => {
+    if (jobState !== 'scanning' || !currentJobId) return;
+    let cancelled = false;
+
+    const pollStatus = async () => {
+      while (!cancelled) {
+        try {
+          const response = await api.get(`/report/${currentJobId}`);
+          const data = response.data;
+
+          if (data.status === 'running') {
+            setProgress(Math.min(95, 20 + (data.elapsed_seconds || 0) * 2));
+            setLiveText(data.current_action || 'Processing...');
+          } else if (data.status === 'complete') {
+            setProgress(100);
+            // The backend returns report_json which contains all the report data
+            // We need to merge it with filename and sha256 from the jobs table
+            const reportData = {
+              ...data.report,
+              filename: data.filename,
+              sha256: data.sha256,
+            };
+            setCurrentReport(reportData);
+            setJobState('done');
+            setRoute('reports');
+            // Refresh recent reports
+            try {
+              const reportsList = await api.get('/reports', { params: { page: 1, page_size: 20 } });
+              setRecent((reportsList.data.items || []).map(transformReportForTable));
+            } catch (err) {
+              console.error('Failed to refresh reports:', err);
+            }
+          } else if (data.status === 'failed') {
+            setError(data.error || 'Analysis failed');
+            setJobState('idle');
+            setCurrentJobId(null);
+          } else if (data.status === 'queued') {
+            setProgress(Math.min(10, progress + 1));
+            setLiveText('Queued for analysis...');
+          }
+        } catch (err) {
+          console.error('Poll status error:', err);
+        }
+
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    };
+
+    pollStatus();
+    return () => { cancelled = true; };
+  }, [jobState, currentJobId]);
+
+  const job = currentReport;
 
   const handleFile = (f) => {
     if (!f) { setDroppedFile(null); return; }
     setDroppedFile({
       name: f.name,
-      sizeLabel: bytesToLabel(f.size),
+      sizeLabel: f.size ? bytesToLabel(f.size) : '0 B',
       detectedType: detectType(f.name),
+      file: f,
     });
+    setError(null);
   };
 
-  const handleStart = () => {
-    setJobState('scanning');
-    setRoute('active');
-    setProgress(0);
-    setCompletedSteps(0);
-    setLiveText('');
-    setUsedTools(0);
-    setRecent((prev) => [
-      { name: droppedFile.name, kind: droppedFile.detectedType, verdict: 'unknown', time: 'Just now', mode: mode === 'deep' ? 'Deep' : 'Std' },
-      ...prev.slice(0, 5),
-    ]);
-  };
+  const handleStart = async () => {
+    if (!droppedFile || !droppedFile.file || loading) return;
+    setLoading(true);
+    setError(null);
 
-  // Stream simulation
-  useEffect(() => {
-    if (jobState !== 'scanning') return;
-    let cancelled = false;
+    try {
+      const formData = new FormData();
+      formData.append('file', droppedFile.file);
+      formData.append('mode', mode);
 
-    const startedAt = Date.now();
-    const totalMs = 22000;
-    const tick = setInterval(() => {
-      const pct = Math.min(99, Math.floor(((Date.now() - startedAt) / totalMs) * 100));
-      setProgress(pct);
-    }, 200);
-
-    const run = async () => {
-      const stepDurations = [3000, 4000, 4500, 5000, 4500];
-      for (let i = 0; i < job.reasoningSteps.length; i++) {
-        if (cancelled) return;
-        const s = job.reasoningSteps[i];
-        const txt = s.thought;
-        const dur = stepDurations[i];
-        const chars = txt.length;
-        const perChar = Math.max(8, Math.floor((dur * 0.55) / chars));
-        for (let c = 0; c <= chars; c++) {
-          if (cancelled) return;
-          setLiveText(txt.slice(0, c));
-          await new Promise((r) => setTimeout(r, perChar));
-        }
-        setUsedTools((u) => u + (s.tool.includes(',') ? 2 : Math.max(2, 3 - (i % 2))));
-        await new Promise((r) => setTimeout(r, dur * 0.45));
-        if (cancelled) return;
-        setCompletedSteps(i + 1);
-        setLiveText('');
-      }
-      clearInterval(tick);
-      if (cancelled) return;
-      setProgress(100);
-      setUsedTools(14);
-      await new Promise((r) => setTimeout(r, 500));
-      if (cancelled) return;
-      setJobState('done');
-      setRoute('reports');
-      setRecent((prev) => {
-        const copy = [...prev];
-        if (copy[0]) copy[0] = { ...copy[0], verdict: 'malicious', time: 'Just now' };
-        return copy;
+      const response = await api.post('/analyze', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
       });
-    };
-    run();
 
-    return () => { cancelled = true; clearInterval(tick); };
-  }, [jobState]);
+      const { job_id } = response.data;
+      setCurrentJobId(job_id);
+      setJobState('scanning');
+      setRoute('active');
+      setProgress(0);
+      setCompletedSteps(0);
+      setLiveText('Queued for analysis...');
+      setUsedTools(0);
 
-  const etaSec = Math.max(0, Math.round(((100 - progress) / 100) * 22));
-  const currentStep = job.reasoningSteps[completedSteps];
-  const activeTools = currentStep ? currentStep.tool.split(',').map((t) => t.trim()) : [];
+      // Add to recent list
+      setRecent((prev) => [
+        {
+          name: droppedFile.name,
+          kind: droppedFile.detectedType,
+          verdict: 'scanning',
+          job_id,
+          created_at: new Date().toISOString(),
+          time: 'Just now',
+          mode: mode === 'deep_scan' ? 'Deep' : 'Std',
+        },
+        ...prev.slice(0, 19),
+      ]);
+    } catch (err) {
+      const detail = err.response?.data?.detail;
+      const msg = typeof detail === 'string' ? detail : err.message || 'Upload failed';
+      setError(msg);
+      setLoading(false);
+    }
+  };
+
+
+  const etaSec = Math.max(0, Math.round(((100 - progress) / 100) * 300));
+  const activeTools = [];
   const sidebarRecent = recent.slice(0, 5).map((r) => ({ name: r.name, verdict: r.verdict }));
 
   let main = null;
@@ -118,6 +212,8 @@ export default function App() {
           mode={mode}
           setMode={setMode}
           onStart={handleStart}
+          loading={loading}
+          error={error}
         />
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
           <StatCard value="12,847" label="Files scanned"      sub="last 30 days" />
@@ -142,19 +238,26 @@ export default function App() {
   } else if (route === 'active' && jobState === 'scanning') {
     main = (
       <ActiveJobPage
-        job={job}
+        job={currentReport}
         progress={progress}
         etaSec={etaSec}
         completedSteps={completedSteps}
         liveText={liveText}
         usedTools={usedTools}
-        totalTools={mode === 'deep' ? 20 : 8}
+        totalTools={mode === 'deep_scan' ? 20 : 8}
         activeTools={activeTools}
         isLive={true}
       />
     );
   } else if (route === 'reports' && jobState === 'done') {
-    main = <ReportPage job={job} />;
+    main = currentReport ? <ReportPage job={currentReport} /> : (
+      <div style={{ padding: '24px 28px', maxWidth: 1280, margin: '0 auto' }}>
+        <div className="surface" style={{ padding: 32, borderRadius: 10, textAlign: 'center' }}>
+          <IconList size={28} />
+          <div style={{ marginTop: 12, fontSize: 15, fontWeight: 600 }}>Loading report...</div>
+        </div>
+      </div>
+    );
   } else if (route === 'reports' && jobState !== 'done') {
     main = (
       <div style={{ padding: '24px 28px', maxWidth: 1280, margin: '0 auto' }}>

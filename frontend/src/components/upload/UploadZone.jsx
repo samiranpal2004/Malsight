@@ -3,7 +3,7 @@ import { IconUpload, IconFolder, IconHash, IconArrowRight, IconFile, IconX, Icon
 import ScanModeToggle from '../shared/ScanModeToggle.jsx';
 import DropZoneArt from '../shared/DropZoneArt.jsx';
 
-export default function UploadZone({ onFile, onPasteHash, droppedFile, mode, setMode, onStart }) {
+export default function UploadZone({ onFile, onPasteHash, droppedFile, mode, setMode, onStart, loading, error }) {
   const [hover, setHover] = useState(false);
   const [drag, setDrag] = useState(false);
   const [hashOpen, setHashOpen] = useState(false);
@@ -44,10 +44,20 @@ export default function UploadZone({ onFile, onPasteHash, droppedFile, mode, set
         <div className="divider" style={{ margin: '20px 0' }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
           <ScanModeToggle mode={mode} setMode={setMode} />
-          <button className="btn btn-primary focusable" style={{ marginLeft: 'auto' }} onClick={onStart}>
-            <IconPlay size={13} /> Start analysis
+          <button 
+            className="btn btn-primary focusable" 
+            style={{ marginLeft: 'auto', opacity: loading ? 0.6 : 1 }} 
+            onClick={onStart}
+            disabled={loading}
+          >
+            <IconPlay size={13} /> {loading ? 'Uploading…' : 'Start analysis'}
           </button>
         </div>
+        {error && (
+          <div style={{ marginTop: 12, padding: 12, background: 'rgba(220, 38, 38, 0.1)', border: '1px solid rgba(220, 38, 38, 0.5)', borderRadius: 6, fontSize: 12, color: '#ff6b6b' }}>
+            {error}
+          </div>
+        )}
       </div>
     );
   }
