@@ -18,7 +18,7 @@ htmlcov/
 venv/
 env/
 ENV/
-
+tmp
 # Build and packaging
 build/
 dist/
@@ -46,3 +46,6 @@ frontend/.vite/
 # OS files
 .DS_Store
 Thumbs.db
+
+/tmp
+cloud-sql-proxy.exe

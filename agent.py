@@ -2,6 +2,7 @@
 # See PRD Section 5 (Agent Brain), Section 7 (Modes), Section 8 (Report schema),
 # Appendix A (Tool calling reference), Appendix B (Agent loop).
 import json
+import threading
 import time
 import uuid
 import logging
@@ -23,6 +24,9 @@ MAX_ITERATIONS = {"standard": 8, "deep_scan": 20}
 # Module-level live job status — read by the FastAPI worker (Phase 4).
 # Shape: {job_id: {"step": int, "action": str, "elapsed_seconds": int}}
 JOB_STATUS: dict = {}
+
+# SSE events are stored in Redis (key: malsight:stream:{job_id}) so the uvicorn
+# process and the RQ worker process can share state across process boundaries.
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +625,14 @@ def build_system_prompt(mode: str) -> str:
         "   itself. Call run_sandbox() — extraction happens inside the isolated\n"
         "   container via 7z. The zip password for MalwareBazaar samples is\n"
         "   'infected' and is applied automatically.\n"
+        "9. The sandbox runs on Linux with gVisor. Windows PE32/PE32+ executables\n"
+        "   cannot be executed natively — the sandbox will perform static string\n"
+        "   analysis instead and return a 'note' field explaining this. If\n"
+        "   run_sandbox() returns a note about PE32 detection, this is expected\n"
+        "   behavior. Pivot to static tools (get_pe_imports, get_pe_sections,\n"
+        "   detect_anti_debug, run_yara, extract_strings) for Windows PE analysis.\n"
+        "   capture_memory_dump() will also return captured=False for PE32 files\n"
+        "   on this sandbox — treat it as expected and rely on static analysis.\n"
         "\n"
         "You have the following tools available:\n"
         f"{_TOOL_CATALOG_SUMMARY}"
@@ -647,6 +659,51 @@ def update_job_status(job_id: str, step: int, action: str, start_time: float) ->
         "action": action,
         "elapsed_seconds": int(time.time() - start_time),
     }
+
+
+# ---------------------------------------------------------------------------
+# SSE event emitter
+# ---------------------------------------------------------------------------
+
+def emit_event(job_id: str, event_type: str, content: str, step: int = 0) -> None:
+    """Push a streaming event to Redis so the /stream/{job_id} SSE endpoint can forward it."""
+    import redis as redis_lib
+    import os
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+    try:
+        r = redis_lib.from_url(
+            os.getenv("REDIS_URL", "redis://127.0.0.1:6379"),
+            socket_connect_timeout=2,
+        )
+        event = {
+            "type": event_type,
+            "content": content,
+            "step": step,
+            "timestamp": time.strftime("%H:%M:%S", time.gmtime()),
+        }
+        key = f"malsight:stream:{job_id}"
+        print(f"[EMIT] job={job_id} type={event_type} content={content[:50]}")
+        r.rpush(key, json.dumps(event))
+        r.expire(key, 600)
+    except Exception as e:
+        print(f"[EMIT ERROR] {e}")
+
+
+def _cleanup_events(job_id: str, delay: int = 300) -> None:
+    """Delete the Redis stream key after `delay` seconds."""
+    def _clean() -> None:
+        import redis as redis_lib
+        import os
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+        time.sleep(delay)
+        try:
+            r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379"))
+            r.delete(f"malsight:stream:{job_id}")
+        except Exception:
+            pass
+    threading.Thread(target=_clean, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -788,10 +845,14 @@ def build_report(
 
     vp = verdict_params or {}
 
+    verdict = vp.get("verdict", "suspicious")
+    if verdict not in ("benign", "suspicious", "malicious"):
+        verdict = "suspicious"
+
     report = {
         "job_id": str(uuid.uuid4()),
         "mode": mode,
-        "verdict": vp.get("verdict", "unknown"),
+        "verdict": verdict,
         "confidence": int(vp.get("confidence", 0) or 0),
         "threat_category": vp.get("threat_category", "unknown"),
         "severity": vp.get("severity", "low"),
@@ -916,6 +977,9 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
             if part.text
         ).strip()
 
+        if reasoning_text:
+            emit_event(job_id, "thought", reasoning_text, step=iterations)
+
         # Extract function calls
         tool_calls = []
         for part in candidate.parts:
@@ -944,6 +1008,7 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
 
             # Termination signal — agent says it's done
             if tool_name == "get_report":
+                emit_event(job_id, "thought", "Evidence sufficient. Generating final report...", step=iterations)
                 reasoning_chain.append({
                     "step_number": iterations,
                     "reasoning": reasoning_text,
@@ -959,6 +1024,7 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
                     f"Step {iterations} — Agent committed final verdict. Building report...",
                     start_time,
                 )
+                _cleanup_events(job_id)
                 return build_report(
                     verdict_params=tool_params,
                     reasoning_chain=reasoning_chain,
@@ -976,15 +1042,18 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
             )
 
             try:
+                params_json = json.dumps(tool_params, default=str)
+            except Exception:
+                params_json = str(tool_params)
+            emit_event(job_id, "tool_call", f"Calling: {tool_name}({params_json})", step=iterations)
+
+            try:
                 result = execute_tool(tool_name, tool_params, file_path, file_meta)
             except Exception as e:
                 logger.exception("execute_tool raised for %s", tool_name)
                 result = {"error": str(e), "tool": tool_name}
 
-            try:
-                params_json = json.dumps(tool_params, default=str)
-            except Exception:
-                params_json = str(tool_params)
+            emit_event(job_id, "tool_result", _summarize_result(tool_name, result), step=iterations)
 
             reasoning_chain.append({
                 "step_number": iterations,
@@ -993,11 +1062,19 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
                 "result_summary": _summarize_result(tool_name, result),
             })
 
+            # FunctionResponse.response must be a dict; wrap lists/scalars.
+            if isinstance(result, list):
+                safe_result = {"items": result, "count": len(result)}
+            elif not isinstance(result, dict):
+                safe_result = {"value": str(result)}
+            else:
+                safe_result = result
+
             tool_result_parts.append(
                 types.Part(
                     function_response=types.FunctionResponse(
                         name=tool_name,
-                        response=result,
+                        response=safe_result,
                     )
                 )
             )
@@ -1011,9 +1088,10 @@ def run_agent(file_path: str, file_meta: dict, mode: str) -> dict:
         f"Step {iterations} — Max iterations hit; force-terminating with incomplete verdict.",
         start_time,
     )
+    _cleanup_events(job_id)
     return build_report(
         verdict_params={
-            "verdict": "unknown",
+            "verdict": "suspicious",
             "confidence": 0,
             "threat_category": "unknown",
             "severity": "low",

@@ -3,6 +3,7 @@
 import hashlib
 import os
 import re
+import threading
 
 from malsight.config import SANDBOX_IMAGE, GCP_PROJECT, GKE_CLUSTER, GKE_ZONE
 import tempfile
@@ -20,6 +21,74 @@ _state: dict = {
     "dump_path": None,
     "created_files": [],
 }
+
+# Per-job memory snapshot results keyed by job_id
+_memdump_state: dict = {}
+
+
+def _build_sandbox_command(file_path: str, duration: int, capture_focus: str) -> list:
+    """Return a ["/bin/sh", "-c", script] command appropriate for the file type."""
+    ext = os.path.splitext(file_path)[1].lower()
+    filename = os.path.basename(file_path)
+
+    strace_filter = {
+        "network":    "-f -e trace=network,process",
+        "filesystem": "-f -e trace=file",
+        "process":    "-f -e trace=process",
+    }.get(capture_focus, "-f -e trace=network,process,file")
+    strace_flags = f"{strace_filter} -o /tmp/strace.log"
+    sleep_sec = min(duration, 30)
+
+    if ext in ('.exe', '.dll'):
+        script = (
+            f'FILE_TYPE=$(file /sample/{filename} 2>/dev/null || echo "unknown")\n'
+            f'echo "sandbox_file_type: $FILE_TYPE" > /tmp/strace.log\n'
+            f'echo "sandbox_note: Windows PE32 binary - static string analysis only" >> /tmp/strace.log\n'
+            f'strings /sample/{filename} 2>/dev/null | head -200 >> /tmp/strace.log\n'
+            f'echo "sandbox_complete: static_only" >> /tmp/strace.log\n'
+            f'cat /tmp/strace.log'
+        )
+    elif ext == '.py':
+        script = (
+            f'strace {strace_flags} python3 /sample/{filename} > /tmp/sandbox_stdout.log 2>&1 &\n'
+            f'STRACE_PID=$!\n'
+            f'sleep {sleep_sec}\n'
+            f'kill $STRACE_PID 2>/dev/null || true\n'
+            f'wait 2>/dev/null || true\n'
+            f'cat /tmp/strace.log 2>/dev/null || echo "no strace output"\n'
+            f'echo "sandbox_complete: python_executed" >> /tmp/strace.log'
+        )
+    elif ext in ('.sh', '.bash'):
+        script = (
+            f'strace {strace_flags} /bin/bash /sample/{filename} > /tmp/sandbox_stdout.log 2>&1 &\n'
+            f'STRACE_PID=$!\n'
+            f'sleep {sleep_sec}\n'
+            f'kill $STRACE_PID 2>/dev/null || true\n'
+            f'wait 2>/dev/null || true\n'
+            f'cat /tmp/strace.log 2>/dev/null || echo "no strace output"\n'
+            f'echo "sandbox_complete: shell_executed" >> /tmp/strace.log'
+        )
+    elif ext == '.pdf':
+        script = (
+            f'strings /sample/{filename} > /tmp/sandbox_stdout.log 2>&1\n'
+            f'echo "sandbox_note: PDF static analysis" > /tmp/strace.log\n'
+            f'echo "sandbox_complete: pdf_static" >> /tmp/strace.log\n'
+            f'cat /tmp/strace.log'
+        )
+    else:
+        # Native ELF or unknown — copy to /tmp so we can chmod (ConfigMap mount is read-only)
+        script = (
+            f'cp /sample/{filename} /tmp/target_bin && chmod +x /tmp/target_bin\n'
+            f'strace {strace_flags} /tmp/target_bin > /tmp/sandbox_stdout.log 2>&1 &\n'
+            f'STRACE_PID=$!\n'
+            f'sleep {sleep_sec}\n'
+            f'kill $STRACE_PID 2>/dev/null || true\n'
+            f'wait 2>/dev/null || true\n'
+            f'cat /tmp/strace.log 2>/dev/null || echo "no strace output"\n'
+            f'echo "sandbox_complete: direct_executed" >> /tmp/strace.log'
+        )
+
+    return ["/bin/sh", "-c", script]
 
 
 def _load_kube_config() -> None:
@@ -43,6 +112,36 @@ def _get_env_or_error() -> tuple:
     if missing:
         raise RuntimeError(f"missing env vars: {', '.join(missing)}")
     return image, project, cluster, zone
+
+
+def _snapshot_memory(job_id: str, pod_name: str, namespace: str, timing: int) -> None:
+    """Background thread: capture /proc/1/maps from a running pod at T+timing seconds."""
+    time.sleep(timing)
+    try:
+        _load_kube_config()
+        from kubernetes import client as k8s_client
+        from kubernetes.stream import stream
+
+        core_api = k8s_client.CoreV1Api()
+        resp = stream(
+            core_api.connect_get_namespaced_pod_exec,
+            pod_name,
+            namespace,
+            command=["cat", "/proc/1/maps"],
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+        )
+        _memdump_state[job_id] = {
+            "memdump_maps": resp or "",
+            "memdump_captured": True,
+        }
+    except Exception as e:
+        _memdump_state[job_id] = {
+            "memdump_captured": False,
+            "memdump_error": str(e),
+        }
 
 
 def run_sandbox(
@@ -74,10 +173,10 @@ def run_sandbox(
     namespace = "default"
 
     strace_filter = {
-        "network":    "-e trace=network",
-        "filesystem": "-e trace=file",
-        "process":    "-e trace=process",
-    }.get(capture_focus, "-f")
+        "network":    "-f -e trace=network,process",
+        "filesystem": "-f -e trace=file",
+        "process":    "-f -e trace=process",
+    }.get(capture_focus, "-f -e trace=network,process")
 
     try:
         import base64
@@ -99,13 +198,15 @@ def run_sandbox(
     except Exception as e:
         return {"error": f"sandbox not available: ConfigMap creation failed: {e}"}
 
+    filename = os.path.basename(file_path)
+
     if is_zip:
         # Extraction happens entirely inside the gVisor container — the host
         # filesystem never sees the malware binary.
         command = [
             "/bin/sh", "-c",
             (
-                f"cp /sample/sample /tmp/sample.zip && "
+                f"cp /sample/{filename} /tmp/sample.zip && "
                 f"7z x -p{zip_password} /tmp/sample.zip -o/tmp/extracted/ && "
                 f"EXTRACTED=$(find /tmp/extracted -maxdepth 3 -type f -perm /111 | head -1) && "
                 f"[ -z \"$EXTRACTED\" ] && EXTRACTED=$(find /tmp/extracted -maxdepth 3 -type f | head -1) ; "
@@ -116,16 +217,7 @@ def run_sandbox(
             ),
         ]
     else:
-        command = [
-            "/bin/sh", "-c",
-            (
-                f"cp /sample/sample /tmp/target && "
-                f"chmod +x /tmp/target && "
-                f"timeout {duration} strace {strace_filter} -o /tmp/strace.log /tmp/target "
-                f"> /tmp/output.log 2>&1; "
-                f"cat /tmp/strace.log"
-            ),
-        ]
+        command = _build_sandbox_command(file_path, duration, capture_focus)
 
     job_body = k8s_client.V1Job(
         metadata=k8s_client.V1ObjectMeta(name=job_name, namespace=namespace),
@@ -170,7 +262,10 @@ def run_sandbox(
                         k8s_client.V1Volume(
                             name="sample-volume",
                             config_map=k8s_client.V1ConfigMapVolumeSource(
-                                name=configmap_name
+                                name=configmap_name,
+                                items=[k8s_client.V1KeyToPath(
+                                    key="sample", path=filename
+                                )],
                             ),
                         ),
                     ],
@@ -201,9 +296,10 @@ def run_sandbox(
         "created_files": [],
     })
 
-    # Poll until Job completes or timeout
+    # Poll until Job completes or timeout; start memory snapshot thread once pod is Running
     deadline = time.time() + duration + 10
     pod_name = None
+    snapshot_started = False
     while time.time() < deadline:
         try:
             status = batch_api.read_namespaced_job_status(
@@ -228,6 +324,14 @@ def run_sandbox(
                     pod_name = pods.items[0].metadata.name
             except Exception:
                 pass
+        if pod_name and not snapshot_started:
+            t = threading.Thread(
+                target=_snapshot_memory,
+                args=(job_id, pod_name, namespace, 5),
+                daemon=True,
+            )
+            t.start()
+            snapshot_started = True
         time.sleep(2)
 
     if pod_name is None:
@@ -248,14 +352,20 @@ def run_sandbox(
     if pod_name:
         try:
             log_text = core_api.read_namespaced_pod_log(
-                name=pod_name, namespace=namespace
+                name=pod_name,
+                namespace=namespace,
+                container="sandbox",
+                stderr=True,
+                stdout=True,
             )
         except Exception:
             log_text = ""
 
     # Parse strace lines from pod log
     file_ops = {"reads": 0, "writes": 0, "deletes": 0, "paths": []}
-    network_attempts = {"count": 0, "all_blocked": True}
+    connect_calls: list = []
+    extracted_ips: list = []
+    extracted_ports: list = []
     processes_spawned: list = []
     falco_events: list = []
 
@@ -270,13 +380,26 @@ def run_sandbox(
         elif "unlink" in line:
             file_ops["deletes"] += 1
         elif "connect(" in line:
-            network_attempts["count"] += 1
+            connect_calls.append(line)
+            ip_m = re.search(r'inet_addr\("([^"]+)"\)', line)
+            if ip_m:
+                extracted_ips.append(ip_m.group(1))
+            port_m = re.search(r'sin_port=htons\((\d+)\)', line)
+            if port_m:
+                extracted_ports.append(int(port_m.group(1)))
         elif "execve(" in line:
             m = re.search(r'execve\("([^"]+)"', line)
             if m:
                 proc = os.path.basename(m.group(1))
                 if proc not in processes_spawned:
                     processes_spawned.append(proc)
+
+    network_attempts = {
+        "count": len(connect_calls),
+        "all_blocked": True,
+        "attempted_ips": list(set(extracted_ips)),
+        "attempted_ports": list(set(extracted_ports)),
+    }
 
     # Cleanup Job and ConfigMap
     try:
@@ -290,7 +413,7 @@ def run_sandbox(
     except Exception:
         pass
 
-    return {
+    result = {
         "duration_actual": duration,
         "file_ops": file_ops,
         "network_attempts": network_attempts,
@@ -298,13 +421,27 @@ def run_sandbox(
         "falco_events": falco_events,
     }
 
+    if "sandbox_note: Windows PE32 binary" in (log_text or ""):
+        result["note"] = (
+            "PE32 Windows binary — static analysis performed in sandbox. "
+            "Native execution requires Wine."
+        )
+        skip_prefixes = ("sandbox_file_type:", "sandbox_note:", "sandbox_complete:")
+        result["pe_static_strings"] = [
+            line for line in (log_text or "").splitlines()
+            if line and not any(line.startswith(p) for p in skip_prefixes)
+        ]
+
+    return result
+
 
 def capture_memory_dump(timing: int = 5) -> dict:
-    """Exec gcore inside the running pod at T+timing seconds; copy dump locally."""
-    pod_name = _state.get("pod_name")
-    start_time = _state.get("start_time")
-    namespace = _state.get("namespace", "default")
+    """Return memory snapshot captured during sandbox run, or a graceful failure."""
+    job_id = _state.get("job_id")
+    if not job_id:
+        return {"captured": False, "error": "No active sandbox job"}
 
+    # Honour a previously written dump file (legacy path)
     existing_dump = _state.get("dump_path")
     if existing_dump and os.path.exists(existing_dump):
         return {
@@ -314,75 +451,22 @@ def capture_memory_dump(timing: int = 5) -> dict:
             "dump_path": existing_dump,
         }
 
-    if pod_name is None:
-        return {"captured": False, "error": "no active sandbox pod"}
-
-    if start_time:
-        elapsed = time.time() - start_time
-        wait_time = timing - elapsed
-        if wait_time > 0:
-            time.sleep(wait_time)
-
-    try:
-        _load_kube_config()
-        from kubernetes import client as k8s_client
-        from kubernetes.stream import stream
-
-        core_api = k8s_client.CoreV1Api()
-
-        pid_output = stream(
-            core_api.connect_get_namespaced_pod_exec,
-            pod_name,
-            namespace,
-            command=["sh", "-c", "pgrep -n -f /tmp/target || pgrep -n -f wine"],
-            stderr=True,
-            stdin=False,
-            stdout=True,
-            tty=False,
-        )
-        pid_str = (pid_output or "").strip().split("\n")[0].strip()
-        if not pid_str.isdigit():
-            return {"captured": False, "error": "could not determine target PID"}
-
-        stream(
-            core_api.connect_get_namespaced_pod_exec,
-            pod_name,
-            namespace,
-            command=["gcore", "-o", "/tmp/memdump.bin", pid_str],
-            stderr=True,
-            stdin=False,
-            stdout=True,
-            tty=False,
-        )
-
-        raw = stream(
-            core_api.connect_get_namespaced_pod_exec,
-            pod_name,
-            namespace,
-            command=["cat", "/tmp/memdump.bin"],
-            stderr=False,
-            stdin=False,
-            stdout=True,
-            tty=False,
-        )
-        dump_bytes = raw.encode("latin-1") if isinstance(raw, str) else (raw or b"")
-
-        dump_dir = "/tmp/results"
-        os.makedirs(dump_dir, exist_ok=True)
-        dump_path = os.path.join(dump_dir, "memdump.bin")
-        with open(dump_path, "wb") as fh:
-            fh.write(dump_bytes)
-
-        _state["dump_path"] = dump_path
+    state = _memdump_state.get(job_id, {})
+    if state.get("memdump_captured"):
+        maps = state.get("memdump_maps", "") or ""
         return {
             "captured": True,
             "timing_seconds": timing,
-            "dump_size_bytes": len(dump_bytes),
-            "dump_path": dump_path,
+            "dump_size_bytes": len(maps),
+            "note": "Memory maps captured from running process via /proc/1/maps",
+            "maps_preview": maps[:500],
         }
 
-    except Exception as e:
-        return {"captured": False, "error": str(e)}
+    return {
+        "captured": False,
+        "error": state.get("memdump_error", "Memory snapshot not available"),
+        "note": "gVisor may restrict /proc/mem access — this is expected in the sandbox environment",
+    }
 
 
 def monitor_filesystem(file_path: str = None) -> dict:
