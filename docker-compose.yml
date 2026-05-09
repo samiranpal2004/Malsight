@@ -1,0 +1,195 @@
+version: "3.9"
+
+services:
+  # ── Infrastructure ────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: malsight-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-malsight}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-malsight}
+      POSTGRES_DB:       ${POSTGRES_DB:-malsight}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d   # runs SQL on first boot
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-malsight}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: malsight-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Core API + Worker ─────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: malsight-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL:        postgresql://${POSTGRES_USER:-malsight}:${POSTGRES_PASSWORD:-malsight}@postgres:5432/${POSTGRES_DB:-malsight}
+      REDIS_URL:           redis://redis:6379/0
+      GMAIL_CLIENT_ID:     ${GMAIL_CLIENT_ID:-}
+      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
+      GCP_PROJECT_ID:      ${GCP_PROJECT_ID:-}
+      PUBSUB_TOPIC:        ${PUBSUB_TOPIC:-malsight-gmail-notifications}
+      GMAIL_REDIRECT_URI:  ${GMAIL_REDIRECT_URI:-http://localhost:8000/gmail/oauth/callback}
+      FRONTEND_URL:        ${FRONTEND_URL:-http://localhost:3000}
+    ports:
+      - "8000:8000"
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: malsight-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-malsight}:${POSTGRES_PASSWORD:-malsight}@postgres:5432/${POSTGRES_DB:-malsight}
+      REDIS_URL:    redis://redis:6379/0
+    command: rq worker malsight --url redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Email Gateway ─────────────────────────────────────────────────────────
+  smtp-server:
+    build:
+      context: ./smtp_server
+      dockerfile: Dockerfile
+    container_name: malsight-smtp
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: ${HOST_DATABASE_URL}
+      REDIS_URL:    redis://redis:6379/0
+      SMTP_HOST:    "0.0.0.0"
+      SMTP_PORT:    "2525"   # use 25 if port 25 is available; 2525 works everywhere
+    ports:
+      - "25:2525"            # map host:25 → container:2525 (change to 2525:2525 if port 25 is blocked)
+      - "2525:2525"          # direct access for testing
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  mail-processor:
+    build:
+      context: ./mail_processor
+      dockerfile: Dockerfile
+    container_name: malsight-mail-processor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL:    postgresql://${POSTGRES_USER:-malsight}:${POSTGRES_PASSWORD:-malsight}@postgres:5432/${POSTGRES_DB:-malsight}
+      REDIS_URL:       redis://redis:6379/0
+      MALSIGHT_API_URL: http://api:8000
+      MALSIGHT_API_KEY: ${MALSIGHT_API_KEYS:-}
+      UPLOAD_DIR:      /tmp/malsight_uploads
+    volumes:
+      - upload_staging:/tmp/malsight_uploads
+    depends_on:
+      - api
+      - redis
+      - postgres
+
+  # ── Gmail Connector ───────────────────────────────────────────────────────
+  gmail-connector:
+    build:
+      context: ./gmail_connector
+      dockerfile: Dockerfile
+    container_name: malsight-gmail-connector
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL:        postgresql://${POSTGRES_USER:-malsight}:${POSTGRES_PASSWORD:-malsight}@postgres:5432/${POSTGRES_DB:-malsight}
+      REDIS_URL:           redis://redis:6379/0
+      MALSIGHT_API_URL:    http://api:8000
+      MALSIGHT_API_KEYS:   ${MALSIGHT_API_KEYS:-}
+      GMAIL_CLIENT_ID:     ${GMAIL_CLIENT_ID:-}
+      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
+      GCP_PROJECT_ID:      ${GCP_PROJECT_ID:-}
+      PUBSUB_TOPIC:        ${PUBSUB_TOPIC:-malsight-gmail-notifications}
+      GMAIL_REDIRECT_URI:  ${GMAIL_REDIRECT_URI:-http://localhost:8000/gmail/oauth/callback}
+      GMAIL_POLL_MODE:     ${GMAIL_POLL_MODE:-true}
+      GMAIL_POLL_INTERVAL: ${GMAIL_POLL_INTERVAL:-60}
+      UPLOAD_DIR:          /tmp/malsight_uploads
+    volumes:
+      - upload_staging:/tmp/malsight_uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Dedicated RQ worker for the 'gmail' queue.
+  # Processes jobs enqueued by the Pub/Sub webhook (api/gmail_routes.py).
+  # Runs in the gmail_connector image so Google API packages are available.
+  # Poll-mode processing (renewal.py) uses threads directly — no queue needed.
+  gmail-worker:
+    build:
+      context: ./gmail_connector
+      dockerfile: Dockerfile
+    container_name: malsight-gmail-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL:        postgresql://${POSTGRES_USER:-malsight}:${POSTGRES_PASSWORD:-malsight}@postgres:5432/${POSTGRES_DB:-malsight}
+      REDIS_URL:           redis://redis:6379/0
+      MALSIGHT_API_URL:    http://api:8000
+      MALSIGHT_API_KEYS:   ${MALSIGHT_API_KEYS:-}
+      GMAIL_CLIENT_ID:     ${GMAIL_CLIENT_ID:-}
+      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
+      UPLOAD_DIR:          /tmp/malsight_uploads
+    command: rq worker gmail --url redis://redis:6379/0
+    volumes:
+      - upload_staging:/tmp/malsight_uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Frontend ──────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+        VITE_API_KEY:      ${MALSIGHT_API_KEYS:-}
+    container_name: malsight-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  upload_staging:

@@ -1,0 +1,5 @@
+psycopg2-binary>=2.9
+rq>=1.16
+redis>=5.0
+requests>=2.32
+python-dotenv>=1.0

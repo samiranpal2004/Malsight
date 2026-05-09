@@ -87,7 +87,7 @@ rule Webshell_Generic {
         $cmd    = "$_REQUEST" ascii
         $cmd2   = "$_POST" ascii
     condition:
-        $php and (2 of ($exec*) or ($b64 and 1 of ($exec*)) or ($cmd and 1 of ($exec*)))
+        $php and (2 of ($exec*) or ($b64 and 1 of ($exec*)) or (1 of ($cmd*) and 1 of ($exec*)))
 }
 """,
 }

@@ -9,6 +9,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import router
+from api.mail_routes import router as mail_router
+from api.gmail_routes import router as gmail_router
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,8 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(mail_router)
+app.include_router(gmail_router)
 
 
 @app.on_event("startup")
@@ -43,7 +47,7 @@ async def _startup_checks() -> None:
         logger.warning("PostgreSQL unavailable on startup (will degrade): %s", exc)
 
 
-# ── Redis ───────────────────────────────────────────────────────────────  
+    # ── Redis ───────────────────────────────────────────────────────────────
     try:
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
         logger.info("Redis URL configured: %s", redis_url)

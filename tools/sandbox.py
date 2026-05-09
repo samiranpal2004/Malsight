@@ -150,6 +150,7 @@ def run_sandbox(
     capture_focus: str = "all",
     is_zip: bool = False,
     zip_password: str = "infected",
+    job_id: str = None,
 ) -> dict:
     """Execute file in a GKE gVisor Job; parse strace output from pod logs.
 
@@ -167,7 +168,8 @@ def run_sandbox(
     from kubernetes import client as k8s_client
 
     duration = max(5, min(120, duration))
-    job_id = str(uuid.uuid4())
+    if not job_id:
+        job_id = str(uuid.uuid4())
     job_name = f"malsight-sandbox-{job_id}"
     configmap_name = f"sample-{job_id}"
     namespace = "default"
@@ -287,6 +289,7 @@ def run_sandbox(
 
     _state.update({
         "job_id": job_id,
+        "current_job_id": job_id,
         "pod_name": None,
         "namespace": namespace,
         "results_dir": tempfile.mkdtemp(prefix="malsight_"),
