@@ -115,7 +115,7 @@ def _get_env_or_error() -> tuple:
 
 
 def _snapshot_memory(job_id: str, pod_name: str, namespace: str, timing: int) -> None:
-    """Background thread: capture /proc/1/maps from a running pod at T+timing seconds."""
+    """Background thread: capture memory maps, process list, and open FDs at T+timing seconds."""
     time.sleep(timing)
     try:
         _load_kube_config()
@@ -123,25 +123,52 @@ def _snapshot_memory(job_id: str, pod_name: str, namespace: str, timing: int) ->
         from kubernetes.stream import stream
 
         core_api = k8s_client.CoreV1Api()
-        resp = stream(
-            core_api.connect_get_namespaced_pod_exec,
-            pod_name,
-            namespace,
-            command=["cat", "/proc/1/maps"],
-            stderr=True,
-            stdin=False,
-            stdout=True,
-            tty=False,
-        )
+
+        try:
+            maps_output = stream(
+                core_api.connect_get_namespaced_pod_exec,
+                pod_name, namespace,
+                command=["cat", "/proc/1/maps"],
+                stderr=True, stdin=False, stdout=True, tty=False,
+            )
+        except Exception as e:
+            maps_output = f"maps unavailable: {e}"
+
+        try:
+            ps_output = stream(
+                core_api.connect_get_namespaced_pod_exec,
+                pod_name, namespace,
+                command=["ps", "aux"],
+                stderr=True, stdin=False, stdout=True, tty=False,
+            )
+        except Exception as e:
+            ps_output = f"ps unavailable: {e}"
+
+        try:
+            fd_output = stream(
+                core_api.connect_get_namespaced_pod_exec,
+                pod_name, namespace,
+                command=["ls", "-la", "/proc/1/fd"],
+                stderr=True, stdin=False, stdout=True, tty=False,
+            )
+        except Exception as e:
+            fd_output = f"fd unavailable: {e}"
+
         _memdump_state[job_id] = {
-            "memdump_maps": resp or "",
+            "memdump_maps": (maps_output or "")[:5000],
+            "process_list": (ps_output or "")[:2000],
+            "open_fds": (fd_output or "")[:1000],
+            "dump_size_bytes": len(maps_output) if isinstance(maps_output, str) else 0,
+            "pod_name": pod_name,
             "memdump_captured": True,
         }
+        print(f"[SANDBOX] Memory snapshot captured for job {job_id}")
     except Exception as e:
         _memdump_state[job_id] = {
             "memdump_captured": False,
             "memdump_error": str(e),
         }
+        print(f"[SANDBOX] Memory snapshot failed for job {job_id}: {e}")
 
 
 def run_sandbox(
@@ -150,6 +177,7 @@ def run_sandbox(
     capture_focus: str = "all",
     is_zip: bool = False,
     zip_password: str = "infected",
+    job_id: str = None,
 ) -> dict:
     """Execute file in a GKE gVisor Job; parse strace output from pod logs.
 
@@ -167,7 +195,8 @@ def run_sandbox(
     from kubernetes import client as k8s_client
 
     duration = max(5, min(120, duration))
-    job_id = str(uuid.uuid4())
+    if not job_id:
+        job_id = str(uuid.uuid4())
     job_name = f"malsight-sandbox-{job_id}"
     configmap_name = f"sample-{job_id}"
     namespace = "default"
@@ -287,6 +316,7 @@ def run_sandbox(
 
     _state.update({
         "job_id": job_id,
+        "current_job_id": job_id,
         "pod_name": None,
         "namespace": namespace,
         "results_dir": tempfile.mkdtemp(prefix="malsight_"),
@@ -439,9 +469,12 @@ def capture_memory_dump(timing: int = 5) -> dict:
     """Return memory snapshot captured during sandbox run, or a graceful failure."""
     job_id = _state.get("job_id")
     if not job_id:
-        return {"captured": False, "error": "No active sandbox job"}
+        return {
+            "captured": False,
+            "error": "No active sandbox job — run run_sandbox() first",
+            "note": "Memory dump requires an active sandbox execution",
+        }
 
-    # Honour a previously written dump file (legacy path)
     existing_dump = _state.get("dump_path")
     if existing_dump and os.path.exists(existing_dump):
         return {
@@ -451,21 +484,38 @@ def capture_memory_dump(timing: int = 5) -> dict:
             "dump_path": existing_dump,
         }
 
+    # Wait up to 5 seconds if snapshot thread hasn't finished yet
+    for _ in range(10):
+        if job_id in _memdump_state:
+            break
+        time.sleep(0.5)
+
     state = _memdump_state.get(job_id, {})
+
     if state.get("memdump_captured"):
         maps = state.get("memdump_maps", "") or ""
         return {
             "captured": True,
             "timing_seconds": timing,
-            "dump_size_bytes": len(maps),
-            "note": "Memory maps captured from running process via /proc/1/maps",
-            "maps_preview": maps[:500],
+            "dump_size_bytes": state.get("dump_size_bytes", len(maps)),
+            "memory_maps_preview": maps[:500],
+            "process_list": state.get("process_list", ""),
+            "open_fds": state.get("open_fds", ""),
+            "pod_name": state.get("pod_name", ""),
+            "note": "Memory maps captured from live pod during execution",
+        }
+
+    if state.get("memdump_captured") is False:
+        return {
+            "captured": False,
+            "error": state.get("memdump_error", "Snapshot failed"),
+            "note": "gVisor restricts /proc/mem — memory maps captured instead",
         }
 
     return {
         "captured": False,
-        "error": state.get("memdump_error", "Memory snapshot not available"),
-        "note": "gVisor may restrict /proc/mem access — this is expected in the sandbox environment",
+        "error": "Memory snapshot not ready — sandbox may have exited too fast",
+        "note": "Try submitting in deep_scan mode with longer duration",
     }
 
 

@@ -9,6 +9,13 @@ from tools.static_analysis import (
     analyze_pdf_structure, deobfuscate_script,
 )
 from tools.sandbox import run_sandbox, capture_memory_dump, monitor_filesystem, get_dropped_files
+
+_current_job_id: str = ""
+
+
+def set_current_job_id(job_id: str) -> None:
+    global _current_job_id
+    _current_job_id = job_id
 from tools.memory import (
     scan_pe_headers, extract_strings_from_memory, detect_shellcode,
     get_memory_entropy, analyze_injected_pe, run_yara,
@@ -56,6 +63,7 @@ def execute_tool(
                                     p.get("capture_focus", "all"),
                                     _meta.get("is_zip", False),
                                     _meta.get("zip_password", "infected"),
+                                    job_id=_current_job_id or None,
                                 ),
         "capture_memory_dump": lambda p: capture_memory_dump(p.get("timing", 5)),
         "monitor_filesystem":  lambda p: monitor_filesystem(file_path),

@@ -23,6 +23,7 @@ from pathlib import Path
 # agent.run_agent() is the Phase 3 Gemini loop.  It calls agent.update_job_status()
 # internally, writing progress to agent.JOB_STATUS (same process only — see note above).
 import agent as _malsight_agent
+from tool_executor import set_current_job_id
 
 from api import db
 from tools.static_analysis import get_entropy
@@ -100,6 +101,7 @@ def analyze_file_job(
 
         # ── Step 3 ──────────────────────────────────────────────────────────
         logger.info("Job %s: starting agent loop (mode=%s)", job_id, mode)
+        set_current_job_id(job_id)
         report = _malsight_agent.run_agent(file_path, file_meta, mode)
 
         # ── Step 4 ──────────────────────────────────────────────────────────

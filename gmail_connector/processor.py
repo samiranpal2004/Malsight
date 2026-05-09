@@ -34,6 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 MALSIGHT_API_URL = os.environ.get("MALSIGHT_API_URL", "http://localhost:8000")
+MALSIGHT_PUBLIC_URL = os.environ.get("MALSIGHT_PUBLIC_URL", "http://localhost:5173")
 _api_keys_raw = os.environ.get("MALSIGHT_API_KEYS") or os.environ.get("MALSIGHT_API_KEY", "")
 MALSIGHT_API_KEY = _api_keys_raw.split(",")[0].strip()
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/tmp/malsight_uploads")
@@ -44,6 +45,80 @@ SUPPORTED_EXTENSIONS = {
 }
 
 _HEADERS = {"X-API-Key": MALSIGHT_API_KEY}
+
+
+# ── Verdict reply ─────────────────────────────────────────────────────────────
+
+def send_verdict_reply(
+    service, gmail_message_id: str, attachments: list, thread_id: str
+) -> None:
+    """Send a reply in the same Gmail thread with scan results."""
+    from email.mime.text import MIMEText
+
+    original = service.users().messages().get(
+        userId="me", id=gmail_message_id, format="metadata",
+        metadataHeaders=["Subject", "From", "To"],
+    ).execute()
+
+    headers = {h["name"]: h["value"] for h in original["payload"]["headers"]}
+    original_subject = headers.get("Subject", "")
+    original_to = headers.get("To", "")
+
+    VERDICT_LABEL = {
+        "benign":     "🟢 Benign",
+        "suspicious": "🟡 Suspicious",
+        "malicious":  "🔴 Malicious",
+    }
+    SEVERITY_EMOJI = {"low": "🟢", "medium": "🟡", "high": "🟠", "critical": "🔴"}
+
+    lines = ["🔍 MalSight Attachment Scan Results", "━" * 40, ""]
+
+    for att in attachments:
+        filename       = att.get("filename", "attachment")
+        verdict        = att.get("verdict", "unknown")
+        confidence     = att.get("confidence", 0)
+        category       = att.get("threat_category", "unknown")
+        severity       = att.get("severity", "low")
+        job_id         = att.get("job_id", "")
+        key_indicators = att.get("key_indicators", [])
+
+        verdict_str = VERDICT_LABEL.get(verdict, verdict)
+        sev_emoji   = SEVERITY_EMOJI.get(severity, "")
+
+        lines.append(f"📎 {filename}")
+        lines.append(f"   Verdict:  {verdict_str} ({confidence}% confidence)")
+        lines.append(f"   Category: {category}")
+        lines.append(f"   Severity: {sev_emoji} {severity.title()}")
+
+        if key_indicators:
+            lines.append("")
+            lines.append("   Key Findings:")
+            for indicator in key_indicators[:4]:
+                lines.append(f"   • {indicator}")
+
+        if job_id:
+            lines.append("")
+            lines.append(f"   📄 Full Report: {MALSIGHT_PUBLIC_URL}/job/{job_id}/report")
+
+        lines.append("")
+
+    lines += ["━" * 40, "Scanned automatically by MalSight AI", "https://malsight.app"]
+
+    reply = MIMEText("\n".join(lines), "plain")
+    reply["To"] = original_to
+    reply["Subject"] = (
+        f"Re: {original_subject}"
+        if not original_subject.startswith("Re:")
+        else original_subject
+    )
+    reply["In-Reply-To"] = gmail_message_id
+    reply["References"]  = gmail_message_id
+
+    raw = base64.urlsafe_b64encode(reply.as_bytes()).decode("utf-8")
+    service.users().messages().send(
+        userId="me",
+        body={"raw": raw, "threadId": thread_id},
+    ).execute()
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
@@ -106,6 +181,7 @@ def _process_single_message(
     message = service.users().messages().get(
         userId="me", id=message_id, format="full"
     ).execute()
+    thread_id = message.get("threadId", "")
 
     headers = {
         h["name"].lower(): h["value"]
@@ -168,8 +244,14 @@ def _process_single_message(
         submitted.append((attachment_id, job_id, filename))
 
     # Poll for verdicts
+    attachment_verdicts: list[dict] = []
     for attachment_id, job_id, filename in submitted:
         if job_id is None:
+            attachment_verdicts.append({
+                "filename": filename, "verdict": "suspicious", "confidence": 0,
+                "threat_category": "scan_error", "severity": "medium",
+                "job_id": "", "key_indicators": [],
+            })
             continue
         report = _poll_for_verdict(job_id)
         if report:
@@ -178,9 +260,10 @@ def _process_single_message(
             threat_category = report.get("threat_category", "")
             severity        = report.get("severity", "medium")
             mitre           = report.get("mitre_techniques", [])
+            key_indicators  = report.get("key_indicators", [])
         else:
-            verdict, confidence, threat_category, severity, mitre = (
-                "suspicious", 0, "scan_timeout", "medium", []
+            verdict, confidence, threat_category, severity, mitre, key_indicators = (
+                "suspicious", 0, "scan_timeout", "medium", [], []
             )
 
         update_attachment_verdict(attachment_id, verdict, confidence, threat_category, severity)
@@ -191,6 +274,16 @@ def _process_single_message(
                 f"Malicious: {threat_category or 'unknown'}",
                 verdict, mitre,
             )
+
+        attachment_verdicts.append({
+            "filename": filename,
+            "verdict": verdict,
+            "confidence": confidence,
+            "threat_category": threat_category,
+            "severity": severity,
+            "job_id": job_id,
+            "key_indicators": key_indicators,
+        })
 
     # Delivery decision
     all_attachments = get_attachments_for_email(email_id)
@@ -208,6 +301,12 @@ def _process_single_message(
         update_email_status(email_id, "delivered")
         _apply_gmail_labels(service, message_id, "benign", account)
         logger.info("Gmail message %s CLEAN", message_id)
+
+    try:
+        send_verdict_reply(service, message_id, attachment_verdicts, thread_id)
+        logger.info("Sent verdict reply for Gmail message %s", message_id)
+    except Exception as exc:
+        logger.error("Failed to send verdict reply for %s: %s", message_id, exc)
 
     # Cleanup staging files
     for a in get_attachments_for_email(email_id):
