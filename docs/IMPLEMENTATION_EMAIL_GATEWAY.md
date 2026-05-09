@@ -979,3 +979,8 @@ and the email disappear from INBOX into `MALSIGHT_QUARANTINE` — all live.
 - **SIEM integration** — forward all verdicts as structured events to Splunk / ELK
 - **Outlook / Microsoft 365** — same pattern as Gmail using Microsoft Graph API + webhook subscriptions instead of Pub/Sub
 - **ProtonMail Bridge** — ProtonMail exposes a local IMAP/SMTP bridge; MalSight can connect to it the same way as the custom SMTP server
+
+
+
+
+

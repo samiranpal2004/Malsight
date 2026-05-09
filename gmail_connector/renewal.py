@@ -143,4 +143,13 @@ if __name__ == "__main__":
                 poll_new_messages()
         except Exception as exc:
             logger.error("Renewal loop error: %s", exc)
+            if "connection" in str(exc).lower():
+                try:
+                    from api.db import _pool
+                    if _pool:
+                        _pool.closeall()
+                except Exception:
+                    pass
+            time.sleep(POLL_INTERVAL)
+            continue
         time.sleep(POLL_INTERVAL)

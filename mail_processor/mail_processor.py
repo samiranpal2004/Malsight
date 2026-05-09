@@ -11,15 +11,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from db import (
-    create_quarantine_log,
-    get_attachments_for_email,
-    get_email,
-    save_email_attachment,
-    update_attachment_job,
-    update_attachment_verdict,
-    update_email_status,
-)
+try:
+    # Running from project root: `mail_processor` is a package.
+    from mail_processor.db import (
+        create_quarantine_log,
+        get_attachments_for_email,
+        get_email,
+        save_email_attachment,
+        update_attachment_job,
+        update_attachment_verdict,
+        update_email_status,
+    )
+except ImportError:
+    # Running inside the mail_processor Docker image where files are flat in /app.
+    from db import (  # type: ignore[no-redef]
+        create_quarantine_log,
+        get_attachments_for_email,
+        get_email,
+        save_email_attachment,
+        update_attachment_job,
+        update_attachment_verdict,
+        update_email_status,
+    )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
