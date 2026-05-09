@@ -42,13 +42,6 @@ def get_db_connection() -> psycopg2.extensions.connection:
     return psycopg2.connect(DATABASE_URL())
 
 
-def init_tables() -> None:
-    """No-op stub kept for startup compatibility — schema is managed externally."""
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-
-
 # ---------------------------------------------------------------------------
 # Job helpers
 # ---------------------------------------------------------------------------
@@ -253,3 +246,346 @@ def delete_report(job_id: str) -> bool:
             cur.execute("DELETE FROM reports WHERE job_id = %s", (job_id,))
             cur.execute("DELETE FROM jobs    WHERE id = %s", (job_id,))
             return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Email gateway — table init
+# ---------------------------------------------------------------------------
+
+_EMAIL_GATEWAY_DDL = """
+CREATE TABLE IF NOT EXISTS emails (
+    id                UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    received_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    mail_from         TEXT        NOT NULL,
+    rcpt_to           TEXT[]      NOT NULL,
+    subject           TEXT,
+    sender_display    TEXT,
+    reply_to          TEXT,
+    body_text         TEXT,
+    body_html         TEXT,
+    raw_message       BYTEA,
+    delivery_status   TEXT        NOT NULL DEFAULT 'held'
+                      CHECK (delivery_status IN ('held', 'delivered', 'warned', 'quarantined')),
+    recipient_address TEXT        NOT NULL,
+    source            TEXT        NOT NULL DEFAULT 'smtp'
+                      CHECK (source IN ('smtp', 'gmail')),
+    gmail_message_id  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS email_attachments (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    email_id        UUID        NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    filename        TEXT        NOT NULL,
+    content_type    TEXT,
+    file_size_bytes BIGINT,
+    sha256          CHAR(64),
+    job_id          UUID        REFERENCES jobs(id) ON DELETE SET NULL,
+    verdict         TEXT        CHECK (verdict IN ('benign', 'suspicious', 'malicious')),
+    confidence      INTEGER,
+    threat_category TEXT,
+    severity        TEXT,
+    staging_path    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS quarantine_log (
+    id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    quarantined_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    email_id         UUID        NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+    attachment_id    UUID        REFERENCES email_attachments(id) ON DELETE SET NULL,
+    reason           TEXT,
+    verdict          TEXT,
+    mitre_techniques JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_emails_recipient  ON emails (recipient_address);
+CREATE INDEX IF NOT EXISTS idx_emails_status     ON emails (delivery_status);
+CREATE INDEX IF NOT EXISTS idx_emails_received   ON emails (received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_attachments_job   ON email_attachments (job_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_email ON email_attachments (email_id);
+"""
+
+
+_GMAIL_ACCOUNTS_DDL = """
+CREATE TABLE IF NOT EXISTS gmail_accounts (
+    id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    connected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    email_address       TEXT        NOT NULL UNIQUE,
+    access_token        TEXT        NOT NULL,
+    refresh_token       TEXT        NOT NULL,
+    token_expiry        TIMESTAMPTZ,
+    last_history_id     TEXT,
+    watch_expiry        TIMESTAMPTZ,
+    active              BOOLEAN     NOT NULL DEFAULT TRUE,
+    label_clean         TEXT,
+    label_suspicious    TEXT,
+    label_malicious     TEXT,
+    label_quarantine    TEXT,
+    label_scanning      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_gmail_accounts_email  ON gmail_accounts (email_address);
+CREATE INDEX IF NOT EXISTS idx_gmail_accounts_active ON gmail_accounts (active);
+"""
+
+
+def init_tables() -> None:
+    """Create email gateway and Gmail account tables on startup (idempotent)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_EMAIL_GATEWAY_DDL)
+            cur.execute(_GMAIL_ACCOUNTS_DDL)
+
+
+# ---------------------------------------------------------------------------
+# Email gateway — query helpers
+# ---------------------------------------------------------------------------
+
+def list_emails(
+    recipient: str,
+    page: int,
+    page_size: int,
+) -> tuple[list[dict], int]:
+    offset = (page - 1) * page_size
+
+    list_sql = """
+        SELECT
+            e.id            AS email_id,
+            e.received_at,
+            e.mail_from,
+            e.sender_display,
+            e.subject,
+            e.delivery_status,
+            e.source,
+            COALESCE(
+                json_agg(
+                    json_build_object(
+                        'id',             a.id::text,
+                        'filename',       a.filename,
+                        'verdict',        a.verdict,
+                        'confidence',     a.confidence,
+                        'threat_category',a.threat_category,
+                        'severity',       a.severity
+                    ) ORDER BY a.created_at
+                ) FILTER (WHERE a.id IS NOT NULL),
+                '[]'::json
+            ) AS attachments
+        FROM emails e
+        LEFT JOIN email_attachments a ON a.email_id = e.id
+        WHERE e.recipient_address = %s
+        GROUP BY e.id
+        ORDER BY e.received_at DESC
+        LIMIT %s OFFSET %s
+    """
+    count_sql = "SELECT COUNT(*) FROM emails WHERE recipient_address = %s"
+
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(count_sql, (recipient,))
+            total: int = cur.fetchone()["count"]  # type: ignore[index]
+            cur.execute(list_sql, (recipient, page_size, offset))
+            rows = [dict(r) for r in cur.fetchall()]
+
+    for row in rows:
+        if isinstance(row.get("received_at"), datetime):
+            row["received_at"] = row["received_at"].isoformat()
+
+    return rows, total
+
+
+def get_email_with_attachments(email_id: str) -> dict | None:
+    sql = """
+        SELECT
+            e.id            AS email_id,
+            e.received_at,
+            e.mail_from,
+            e.sender_display,
+            e.subject,
+            e.reply_to,
+            e.body_text,
+            e.body_html,
+            e.delivery_status,
+            e.recipient_address,
+            COALESCE(
+                json_agg(
+                    json_build_object(
+                        'id',             a.id::text,
+                        'filename',       a.filename,
+                        'content_type',   a.content_type,
+                        'file_size_bytes',a.file_size_bytes,
+                        'verdict',        a.verdict,
+                        'confidence',     a.confidence,
+                        'threat_category',a.threat_category,
+                        'severity',       a.severity,
+                        'job_id',         a.job_id::text
+                    ) ORDER BY a.created_at
+                ) FILTER (WHERE a.id IS NOT NULL),
+                '[]'::json
+            ) AS attachments
+        FROM emails e
+        LEFT JOIN email_attachments a ON a.email_id = e.id
+        WHERE e.id = %s
+        GROUP BY e.id
+    """
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (email_id,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            if isinstance(d.get("received_at"), datetime):
+                d["received_at"] = d["received_at"].isoformat()
+            return d
+
+
+def get_attachment_with_report(attachment_id: str) -> dict | None:
+    sql = """
+        SELECT
+            a.id::text          AS attachment_id,
+            a.filename,
+            a.content_type,
+            a.file_size_bytes,
+            a.sha256,
+            a.verdict,
+            a.confidence,
+            a.threat_category,
+            a.severity,
+            a.job_id::text      AS job_id,
+            r.report_json
+        FROM email_attachments a
+        LEFT JOIN reports r ON r.job_id = a.job_id
+        WHERE a.id = %s
+    """
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (attachment_id,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            if isinstance(d.get("report_json"), str):
+                import json as _json
+                d["report_json"] = _json.loads(d["report_json"])
+            return d
+
+
+def list_quarantine(page: int, page_size: int) -> tuple[list[dict], int]:
+    offset = (page - 1) * page_size
+    list_sql = """
+        SELECT
+            q.id::text          AS quarantine_id,
+            q.quarantined_at,
+            q.reason,
+            q.verdict,
+            q.mitre_techniques,
+            e.id::text          AS email_id,
+            e.mail_from,
+            e.sender_display,
+            e.subject,
+            e.received_at,
+            a.filename,
+            a.id::text          AS attachment_id
+        FROM quarantine_log q
+        JOIN emails e ON e.id = q.email_id
+        LEFT JOIN email_attachments a ON a.id = q.attachment_id
+        ORDER BY q.quarantined_at DESC
+        LIMIT %s OFFSET %s
+    """
+    count_sql = "SELECT COUNT(*) FROM quarantine_log"
+
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(count_sql)
+            total: int = cur.fetchone()["count"]  # type: ignore[index]
+            cur.execute(list_sql, (page_size, offset))
+            rows = [dict(r) for r in cur.fetchall()]
+
+    for row in rows:
+        for key in ("quarantined_at", "received_at"):
+            if isinstance(row.get(key), datetime):
+                row[key] = row[key].isoformat()
+
+    return rows, total
+
+
+def release_quarantine_email(email_id: str) -> bool:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE emails SET delivery_status = 'warned'
+                 WHERE id = %s AND delivery_status = 'quarantined'
+                """,
+                (email_id,),
+            )
+            return cur.rowcount > 0
+
+
+def list_gmail_accounts() -> list[dict]:
+    """Return all active Gmail accounts (safe fields only — no tokens)."""
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    email_address,
+                    connected_at,
+                    watch_expiry,
+                    active,
+                    (last_history_id IS NOT NULL) AS watching
+                FROM gmail_accounts
+                WHERE active = TRUE
+                ORDER BY connected_at DESC
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    for row in rows:
+        for key in ("connected_at", "watch_expiry"):
+            if isinstance(row.get(key), datetime):
+                row[key] = row[key].isoformat()
+    return rows
+
+
+def get_email_by_gmail_id(gmail_message_id: str) -> dict | None:
+    """Look up an email row by its Gmail message ID."""
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id::text AS email_id, recipient_address, delivery_status
+                FROM emails
+                WHERE gmail_message_id = %s
+                """,
+                (gmail_message_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def get_mail_stats() -> dict:
+    email_sql = """
+        SELECT
+            COUNT(*)                                        AS total,
+            COUNT(*) FILTER (WHERE delivery_status='held') AS held,
+            COUNT(*) FILTER (WHERE delivery_status='delivered') AS delivered,
+            COUNT(*) FILTER (WHERE delivery_status='warned')    AS warned,
+            COUNT(*) FILTER (WHERE delivery_status='quarantined') AS quarantined
+        FROM emails
+    """
+    attachment_sql = """
+        SELECT
+            COUNT(*)                                          AS total,
+            COUNT(*) FILTER (WHERE verdict='malicious')      AS malicious,
+            COUNT(*) FILTER (WHERE verdict='suspicious')     AS suspicious,
+            COUNT(*) FILTER (WHERE verdict='benign')         AS benign
+        FROM email_attachments
+    """
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(email_sql)
+            email_stats = dict(cur.fetchone())  # type: ignore[arg-type]
+            cur.execute(attachment_sql)
+            att_stats = dict(cur.fetchone())  # type: ignore[arg-type]
+
+    return {"emails": email_stats, "attachments": att_stats}

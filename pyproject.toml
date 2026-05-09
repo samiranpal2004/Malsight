@@ -27,6 +27,7 @@ fastapi = { version = ">=0.111.0", extras = ["standard"] }
 uvicorn = { version = ">=0.29.0", extras = ["standard"] }
 python-multipart = ">=0.0.9"
 rq = ">=1.16"
+aiosmtpd = ">=1.4.6"
 redis = ">=5.0"
 psycopg2-binary = ">=2.9"
 python-dotenv = ">=1.0"
