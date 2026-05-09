@@ -41,4 +41,14 @@ export const releaseQuarantine = (emailId) =>
 
 export const getMailStats = () => api.get('/mail/stats');
 
+// ── Gmail Integration ─────────────────────────────────────────────────────────
+
+export const listGmailAccounts = () => api.get('/gmail/accounts');
+
+export const disconnectGmailAccount = (email) =>
+  api.delete(`/gmail/accounts/${encodeURIComponent(email)}`);
+
+export const releaseGmailQuarantine = (gmailMessageId) =>
+  api.post(`/gmail/release/${gmailMessageId}`);
+
 export default api;

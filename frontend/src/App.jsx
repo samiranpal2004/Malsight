@@ -7,11 +7,13 @@ import Inbox from './pages/Inbox';
 import EmailDetail from './pages/EmailDetail';
 import AttachmentReport from './pages/AttachmentReport';
 import Quarantine from './pages/Quarantine';
+import ConnectGmail from './pages/ConnectGmail';
 
 const NAV_LINKS = [
   { to: '/reports',         label: 'Report History' },
   { to: '/mail',            label: 'Inbox' },
   { to: '/mail/quarantine', label: 'Quarantine' },
+  { to: '/gmail/connect',   label: 'Connect Gmail' },
 ];
 
 export default function App() {
@@ -46,6 +48,7 @@ export default function App() {
             <Route path="/mail/email/:email_id" element={<EmailDetail />} />
             <Route path="/mail/attachment/:attachment_id/report" element={<AttachmentReport />} />
             <Route path="/mail/quarantine" element={<Quarantine />} />
+            <Route path="/gmail/connect"   element={<ConnectGmail />} />
           </Routes>
         </main>
       </div>

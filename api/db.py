@@ -306,11 +306,35 @@ CREATE INDEX IF NOT EXISTS idx_attachments_email ON email_attachments (email_id)
 """
 
 
+_GMAIL_ACCOUNTS_DDL = """
+CREATE TABLE IF NOT EXISTS gmail_accounts (
+    id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    connected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    email_address       TEXT        NOT NULL UNIQUE,
+    access_token        TEXT        NOT NULL,
+    refresh_token       TEXT        NOT NULL,
+    token_expiry        TIMESTAMPTZ,
+    last_history_id     TEXT,
+    watch_expiry        TIMESTAMPTZ,
+    active              BOOLEAN     NOT NULL DEFAULT TRUE,
+    label_clean         TEXT,
+    label_suspicious    TEXT,
+    label_malicious     TEXT,
+    label_quarantine    TEXT,
+    label_scanning      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_gmail_accounts_email  ON gmail_accounts (email_address);
+CREATE INDEX IF NOT EXISTS idx_gmail_accounts_active ON gmail_accounts (active);
+"""
+
+
 def init_tables() -> None:
-    """Create email gateway tables on startup (idempotent)."""
+    """Create email gateway and Gmail account tables on startup (idempotent)."""
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(_EMAIL_GATEWAY_DDL)
+            cur.execute(_GMAIL_ACCOUNTS_DDL)
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +356,7 @@ def list_emails(
             e.sender_display,
             e.subject,
             e.delivery_status,
+            e.source,
             COALESCE(
                 json_agg(
                     json_build_object(
@@ -495,6 +520,47 @@ def release_quarantine_email(email_id: str) -> bool:
                 (email_id,),
             )
             return cur.rowcount > 0
+
+
+def list_gmail_accounts() -> list[dict]:
+    """Return all active Gmail accounts (safe fields only — no tokens)."""
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    email_address,
+                    connected_at,
+                    watch_expiry,
+                    active,
+                    (last_history_id IS NOT NULL) AS watching
+                FROM gmail_accounts
+                WHERE active = TRUE
+                ORDER BY connected_at DESC
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    for row in rows:
+        for key in ("connected_at", "watch_expiry"):
+            if isinstance(row.get(key), datetime):
+                row[key] = row[key].isoformat()
+    return rows
+
+
+def get_email_by_gmail_id(gmail_message_id: str) -> dict | None:
+    """Look up an email row by its Gmail message ID."""
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id::text AS email_id, recipient_address, delivery_status
+                FROM emails
+                WHERE gmail_message_id = %s
+                """,
+                (gmail_message_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
 
 
 def get_mail_stats() -> dict:

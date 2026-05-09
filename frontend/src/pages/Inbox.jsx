@@ -142,6 +142,11 @@ export default function Inbox() {
                   <span className={`text-xs px-2 py-0.5 rounded border font-medium shrink-0 ${STATUS_STYLES[email.delivery_status] ?? 'bg-gray-800 border-gray-600 text-gray-400'}`}>
                     {email.delivery_status?.toUpperCase()}
                   </span>
+                  {email.source === 'gmail' && (
+                    <span className="text-xs px-2 py-0.5 rounded border font-medium shrink-0 bg-blue-950/50 border-blue-800 text-blue-400">
+                      Gmail
+                    </span>
+                  )}
                 </div>
                 <p className="text-sm text-gray-400 truncate">
                   {email.subject || '(no subject)'}
