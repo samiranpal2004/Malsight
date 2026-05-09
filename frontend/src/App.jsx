@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import Sidebar from './components/layout/Sidebar.jsx';
 import TopBar from './components/layout/TopBar.jsx';
 import StatCard from './components/shared/StatCard.jsx';
@@ -40,6 +40,13 @@ const formatTime = (isoStr) => {
   return date.toLocaleDateString();
 };
 
+const formatAnalysisDuration = (seconds) => {
+  if (!seconds && seconds !== 0) return 'Unknown';
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+};
+
 const transformReportForTable = (item) => ({
   name: item.filename,
   kind: detectType(item.filename),
@@ -49,6 +56,28 @@ const transformReportForTable = (item) => ({
   job_id: item.job_id,
   ...item,
 });
+
+const buildReportData = (apiData, fallbackName = 'unknown', capturedSteps = []) => {
+  const report = apiData.report || {};
+  const fileMeta = report.file_meta || {};
+  const rawIocs = report.iocs || {};
+  const flatIocs = [
+    ...(rawIocs.ips || []).map((v) => ({ type: 'IP', value: v, source: 'Analysis' })),
+    ...(rawIocs.urls || []).map((v) => ({ type: 'URL', value: v, source: 'Analysis' })),
+    ...(rawIocs.domains || []).map((v) => ({ type: 'Domain', value: v, source: 'Analysis' })),
+  ];
+  return {
+    ...report,
+    filename: fileMeta.filename || fallbackName,
+    sha256: fileMeta.sha256 || '',
+    family: report.threat_category,
+    toolCalls: report.tools_called,
+    duration: formatAnalysisDuration(report.analysis_time_seconds),
+    iocs: flatIocs,
+    mitre: report.mitre_techniques || [],
+    reasoningSteps: capturedSteps,
+  };
+};
 
 export default function App() {
   const [route, setRoute] = useState('upload');       // 'upload' | 'active' | 'reports' | 'intel'
@@ -62,6 +91,7 @@ export default function App() {
   const [usedTools, setUsedTools] = useState(0);
   const [recent, setRecent] = useState([]);
   const [currentReport, setCurrentReport] = useState(null);
+  const [sseSteps, setSseSteps] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
 
@@ -79,60 +109,101 @@ export default function App() {
     fetchReports();
   }, []);
 
-  // Poll for job status while scanning
+  // Connect to SSE stream while scanning
   useEffect(() => {
     if (jobState !== 'scanning' || !currentJobId) return;
-    let cancelled = false;
 
-    const pollStatus = async () => {
-      while (!cancelled) {
-        try {
-          const response = await api.get(`/report/${currentJobId}`);
-          const data = response.data;
+    const apiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+    const apiKey = import.meta.env.VITE_API_KEY || 'dev-key';
 
-          if (data.status === 'running') {
-            setProgress(Math.min(95, 20 + (data.elapsed_seconds || 0) * 2));
-            setLiveText(data.current_action || 'Processing...');
-          } else if (data.status === 'complete') {
-            setProgress(100);
-            // The backend returns report_json which contains all the report data
-            // We need to merge it with filename and sha256 from the jobs table
-            const reportData = {
-              ...data.report,
-              filename: data.filename,
-              sha256: data.sha256,
-            };
-            setCurrentReport(reportData);
-            setJobState('done');
-            setRoute('reports');
-            // Refresh recent reports
-            try {
-              const reportsList = await api.get('/reports', { params: { page: 1, page_size: 20 } });
-              setRecent((reportsList.data.items || []).map(transformReportForTable));
-            } catch (err) {
-              console.error('Failed to refresh reports:', err);
-            }
-          } else if (data.status === 'failed') {
-            setError(data.error || 'Analysis failed');
-            setJobState('idle');
-            setCurrentJobId(null);
-          } else if (data.status === 'queued') {
-            setProgress(Math.min(10, progress + 1));
-            setLiveText('Queued for analysis...');
-          }
-        } catch (err) {
-          console.error('Poll status error:', err);
+    // Capture file name at effect start to avoid stale closure
+    const fallbackName = droppedFile?.name || 'unknown';
+
+    const stepsRef = { current: [] };
+    let finished = false;
+
+    const finishJob = async () => {
+      if (finished) return;
+      finished = true;
+      setProgress(100);
+      try {
+        const response = await api.get(`/report/${currentJobId}`);
+        const data = response.data;
+        if (data.status === 'failed') {
+          setError(data.error || 'Analysis failed');
+          setJobState('idle');
+          setCurrentJobId(null);
+          return;
         }
-
-        await new Promise((r) => setTimeout(r, 2000));
+        setCurrentReport(buildReportData(data, fallbackName, stepsRef.current));
+        setSseSteps([]);
+        setJobState('done');
+        setRoute('reports');
+        try {
+          const list = await api.get('/reports', { params: { page: 1, page_size: 20 } });
+          setRecent((list.data.items || []).map(transformReportForTable));
+        } catch (err) {
+          console.error('Failed to refresh reports:', err);
+        }
+      } catch (err) {
+        setError('Failed to load report: ' + err.message);
+        setJobState('idle');
       }
     };
 
-    pollStatus();
-    return () => { cancelled = true; };
-  }, [jobState, currentJobId]);
+    const es = new EventSource(
+      `${apiBase}/stream/${currentJobId}?api_key=${encodeURIComponent(apiKey)}`
+    );
 
-  const job = currentReport;
+    es.addEventListener('thought', (e) => {
+      const data = JSON.parse(e.data);
+      const step = {
+        step: stepsRef.current.length + 1,
+        time: new Date().toLocaleTimeString('en-US', { hour12: false }),
+        thought: data.text || data.content || '',
+        tool: '',
+        result: '',
+      };
+      stepsRef.current = [...stepsRef.current, step];
+      setSseSteps([...stepsRef.current]);
+      setLiveText(step.thought);
+      setCompletedSteps(Math.max(0, stepsRef.current.length - 1));
+      setProgress(Math.min(90, 10 + stepsRef.current.length * 8));
+    });
+
+    es.addEventListener('tool_call', (e) => {
+      const data = JSON.parse(e.data);
+      const steps = stepsRef.current;
+      if (steps.length > 0) {
+        const last = { ...steps[steps.length - 1], tool: data.tool || data.name || '' };
+        stepsRef.current = [...steps.slice(0, -1), last];
+        setSseSteps([...stepsRef.current]);
+        setUsedTools(stepsRef.current.filter((s) => s.tool).length);
+      }
+    });
+
+    es.addEventListener('tool_result', (e) => {
+      const data = JSON.parse(e.data);
+      const steps = stepsRef.current;
+      if (steps.length > 0) {
+        const last = { ...steps[steps.length - 1], result: data.result || data.content || '' };
+        stepsRef.current = [...steps.slice(0, -1), last];
+        setSseSteps([...stepsRef.current]);
+      }
+    });
+
+    es.addEventListener('complete', () => {
+      es.close();
+      finishJob();
+    });
+
+    es.onerror = () => {
+      es.close();
+      finishJob();
+    };
+
+    return () => { es.close(); };
+  }, [jobState, currentJobId]);
 
   const handleFile = (f) => {
     if (!f) { setDroppedFile(null); return; }
@@ -167,6 +238,9 @@ export default function App() {
       setCompletedSteps(0);
       setLiveText('Queued for analysis...');
       setUsedTools(0);
+      setSseSteps([]);
+      setCurrentReport(null);
+      setLoading(false);
 
       // Add to recent list
       setRecent((prev) => [
@@ -193,6 +267,28 @@ export default function App() {
   const etaSec = Math.max(0, Math.round(((100 - progress) / 100) * 300));
   const activeTools = [];
   const sidebarRecent = recent.slice(0, 5).map((r) => ({ name: r.name, verdict: r.verdict }));
+
+  const scanningJobMeta = droppedFile ? {
+    filename: droppedFile.name,
+    sha256: '',
+    size: droppedFile.sizeLabel,
+    type: droppedFile.detectedType,
+    mode,
+    reasoningSteps: sseSteps,
+  } : null;
+
+  const handleOpenReport = async (r) => {
+    try {
+      const response = await api.get(`/report/${r.job_id}`);
+      const data = response.data;
+      if (data.status !== 'complete') return;
+      setCurrentReport(buildReportData(data, r.name));
+      setJobState('done');
+      setRoute('reports');
+    } catch (err) {
+      console.error('Failed to load report:', err);
+    }
+  };
 
   let main = null;
 
@@ -230,7 +326,7 @@ export default function App() {
           </div>
           <RecentScansTable
             rows={recent}
-            onOpen={(r) => { if (r.verdict === 'malicious') setRoute('reports'); }}
+            onOpen={handleOpenReport}
           />
         </div>
       </div>
@@ -238,7 +334,7 @@ export default function App() {
   } else if (route === 'active' && jobState === 'scanning') {
     main = (
       <ActiveJobPage
-        job={currentReport}
+        job={scanningJobMeta}
         progress={progress}
         etaSec={etaSec}
         completedSteps={completedSteps}

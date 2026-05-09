@@ -11,7 +11,9 @@ export default function ReportPage({ job }) {
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
         <IconFile size={16} />
         <span className="mono" style={{ fontSize: 14 }}>{job.filename}</span>
-        <span className="hashpill mono">SHA-256 {job.sha256.slice(0, 8)}…{job.sha256.slice(-4)}</span>
+        {job.sha256 && (
+          <span className="hashpill mono">SHA-256 {job.sha256.slice(0, 8)}…{job.sha256.slice(-4)}</span>
+        )}
         <span style={{ marginLeft: 'auto', fontSize: 11.5, color: 'var(--text-muted)', fontFamily: 'JetBrains Mono, monospace' }}>
           report ID · MS-2026-0508-A3F9
         </span>
@@ -23,8 +25,8 @@ export default function ReportPage({ job }) {
         <MitreList mitre={job.mitre} />
       </div>
       <ReasoningChain
-        steps={job.reasoningSteps}
-        completedCount={job.reasoningSteps.length}
+        steps={job.reasoningSteps || []}
+        completedCount={(job.reasoningSteps || []).length}
         liveStreamText=""
         isLive={false}
       />

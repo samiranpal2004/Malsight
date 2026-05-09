@@ -15,15 +15,19 @@ export default function JobHeader({ job, progress, etaSec }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <div className="mono trunc" style={{ fontSize: 15, fontWeight: 500 }}>{job.filename}</div>
             <span className="hashpill" style={{ textTransform: 'uppercase', color: 'var(--amber-300)' }}>
-              {job.mode === 'deep' ? 'Deep Scan' : 'Standard Scan'}
+              {job.mode === 'deep_scan' ? 'Deep Scan' : 'Standard Scan'}
             </span>
           </div>
           <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 14, fontSize: 12, color: 'var(--text-secondary)', fontFamily: 'JetBrains Mono, monospace' }}>
             <span>{job.size}</span>
             <span>·</span>
             <span>{job.type}</span>
-            <span>·</span>
-            <span>SHA-256: <span style={{ color: 'var(--text-primary)' }}>{job.sha256.slice(0, 8)}…{job.sha256.slice(-4)}</span></span>
+            {job.sha256 && (
+              <>
+                <span>·</span>
+                <span>SHA-256: <span style={{ color: 'var(--text-primary)' }}>{job.sha256.slice(0, 8)}…{job.sha256.slice(-4)}</span></span>
+              </>
+            )}
           </div>
         </div>
         <button className="btn btn-ghost" title="Cancel job">

@@ -14,7 +14,7 @@ export default function UploadZone({ onFile, onPasteHash, droppedFile, mode, set
     e.preventDefault();
     setDrag(false);
     const f = e.dataTransfer.files?.[0];
-    if (f) onFile({ name: f.name, size: f.size, type: f.type || 'application/octet-stream' });
+    if (f) onFile(f);
   };
 
   if (droppedFile) {
@@ -65,7 +65,7 @@ export default function UploadZone({ onFile, onPasteHash, droppedFile, mode, set
   // Show mode selector even before file drop
   const modeOptions = [
     { id: 'standard', label: 'Standard', icon: '⚡', desc: 'Fast triage ~60s' },
-    { id: 'deep', label: 'Deep Scan', icon: '🔬', desc: 'Thorough ~5min' },
+    { id: 'deep_scan', label: 'Deep Scan', icon: '🔬', desc: 'Thorough ~5min' },
   ];
 
   return (
@@ -100,7 +100,7 @@ export default function UploadZone({ onFile, onPasteHash, droppedFile, mode, set
           style={{ display: 'none' }}
           onChange={(e) => {
             const f = e.target.files?.[0];
-            if (f) onFile({ name: f.name, size: f.size, type: f.type || 'application/octet-stream' });
+            if (f) onFile(f);
           }}
         />
 

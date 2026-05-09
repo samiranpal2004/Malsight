@@ -1,6 +1,7 @@
 const verdictMap = {
   malicious:  { color: '#FCA5A5', label: 'MALICIOUS' },
   clean:      { color: '#86EFAC', label: 'CLEAN' },
+  benign:     { color: '#86EFAC', label: 'BENIGN' },
   suspicious: { color: '#FCD34D', label: 'SUSPICIOUS' },
   unknown:    { color: 'var(--text-secondary)', label: 'SCANNING' },
 };
